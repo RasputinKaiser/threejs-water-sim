@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Box3D Debug World — Water Lab</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #101014; }
+    #app { width: 100%; height: 100%; }
+    canvas { display: block; }
+    /* console capture overlay (bottom-left, collapsible) */
+    #console-overlay {
+      position: fixed; left: 8px; bottom: 8px; z-index: 1000;
+      width: 460px; max-height: 180px;
+      background: rgba(10,10,14,0.88); border: 1px solid #2a2a35; border-radius: 6px;
+      font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: #c8c8d4; overflow: hidden; display: flex; flex-direction: column;
+      pointer-events: auto;
+    }
+    #console-overlay .hdr {
+      padding: 3px 8px; cursor: pointer; user-select: none;
+      color: #7f8ea3; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+      border-bottom: 1px solid #22222c; display: flex; justify-content: space-between;
+    }
+    #console-overlay .log { padding: 4px 8px; overflow-y: auto; flex: 1; white-space: pre-wrap; word-break: break-word; }
+    #console-overlay .err { color: #ff7b72; }
+    #console-overlay .warn { color: #e3b341; }
+    #console-overlay .info { color: #8b949e; }
+    #console-overlay.min .log { display: none; }
+    /* error/warn/info legend dots (kept in sync with src/debug-harness.js) */
+    #console-overlay .legend { display: inline-flex; gap: 8px; align-items: center; text-transform: none; letter-spacing: 0; color: #9aa4b5; }
+    #console-overlay .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 3px; }
+    #console-overlay .dot.e { background: #ff7b72; } #console-overlay .dot.w { background: #e3b341; } #console-overlay .dot.i { background: #58a6ff; }
+    /* HUD readouts top-left */
+    #hud {
+      position: fixed; left: 10px; top: 10px; z-index: 999;
+      font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: #9aa4b5; background: rgba(10,10,14,0.75); border: 1px solid #26262f;
+      border-radius: 6px; padding: 8px 12px; min-width: 230px; white-space: pre;
+    }
+    #hud b { color: #e8eaf0; font-weight: 600; }
+    #hud .ok { color: #56d364; } #hud .bad { color: #ff7b72; } #hud .warn { color: #e3b341; }
+    /* fps badge next to active scene in nav */
+    #scene-nav a.active .fps {
+      margin-left: 7px; font: 600 10px ui-monospace, Menlo, monospace; color: #cfe0ff;
+      background: rgba(255,255,255,.14); padding: 1px 5px; border-radius: 5px;
+    }
+    /* help hint bottom-right */
+    #hint {
+      position: fixed; right: 10px; bottom: 8px; z-index: 999;
+      font: 11px/1.6 ui-monospace, Menlo, monospace; color: #6a7385; text-align: right;
+    }
+    #hint b { color: #9aa4b5; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

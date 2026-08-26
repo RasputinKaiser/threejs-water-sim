@@ -1,0 +1,19 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# dev/debug artifacts
+.shots/
+.metrics/
+*.log
+
+# editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# agent scratch
+.hermes/cache/
+.hermes/plans/

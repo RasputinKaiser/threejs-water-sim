@@ -1,0 +1,19 @@
+{
+  "name": "threejs-mods",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5184 --strictPort",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "box3d.js": "^0.1.1",
+    "lil-gui": "^0.21.0",
+    "stats.js": "^0.17.0",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "vite": "^7.3.0"
+  }
+}

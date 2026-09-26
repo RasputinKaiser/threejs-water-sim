@@ -65,7 +65,7 @@ const quality = qp.get('quality') ?? 'medium';
 const spacing = { low: 0.2, medium: 0.15, high: 0.12 }[quality] ?? 0.15;
 const water = await createWater({
   renderer: harness.renderer, scene, quality,
-  render: qp.get('render') ?? 'screen',
+  render: qp.get('render') ?? 'screen', backend: qp.get('backend') ?? 'cpu',
   params: { spacing, maxParticles: 32768, bounds: { min: [-12, -4, -12], max: [12, 7, 12] } },
 });
 water.addHeightfield({ minX: -SIZE / 2, minZ: -SIZE / 2, dx: DX, dz: DX, nx: NX, nz: NZ, heights });

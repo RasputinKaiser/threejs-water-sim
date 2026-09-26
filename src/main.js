@@ -85,7 +85,7 @@ if (qp.get('aabb') === '1') debugDraw.state.showAABBs = true;
 const water = await createWater({
   renderer: harness.renderer, scene, b3, world,
   quality: qp.get('quality') ?? 'medium',
-  render: qp.get('render') ?? 'screen',
+  render: qp.get('render') ?? 'screen', backend: qp.get('backend') ?? 'cpu',
   // particles leaving this box are removed (and counted as leaked)
   params: { bounds: { min: [-7, -0.5, -7], max: [7, 9, 7] } },
 });
@@ -147,7 +147,7 @@ harness.setHudProvider(() => {
   const flat = Number.isFinite(probeData.flatness) ? probeData.flatness.toFixed(3) : '—';
   const level = Number.isFinite(probeData.level) ? probeData.level.toFixed(2) : '—';
   return [
-    `<b>Pool Lab</b> — Box3D world + PBF water (hash grid)`,
+    `<b>Pool Lab</b> — Box3D world + particle water (hash grid)`,
     waterHudLine(harness, water),
     `bodies awake <b>${b3.b3World_GetAwakeBodyCount(world)}</b>  colliders <b>${water.stats.colliders ?? 0}</b>`,
     `pool: <b>${probeData.count}</b> particles  level <b>${level}</b> m`,

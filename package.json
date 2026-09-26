@@ -8,7 +8,8 @@
     "build": "vite build",
     "test": "node --test \"test/*.test.mjs\"",
     "fuzz": "node tools/fuzz.mjs",
-    "bench": "node tools/bench.mjs"
+    "bench": "node tools/bench.mjs",
+    "gpu-check": "node tools/gpu-check.mjs"
   },
   "dependencies": {
     "box3d.js": "^0.1.1",

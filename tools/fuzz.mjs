@@ -144,6 +144,11 @@ async function s4ParamChaos(steps) {
 /* S5: 50 random spawns into a region that is drained the same frame. */
 async function s5DrainSpawnRace(steps) {
   const sim = await freshSim();
+  // the untouched water sits in its own tank so it cannot flow into the region
+  // (four wall boxes: a container would make everything outside it solid)
+  sim.setColliders([...FLOOR,
+    { type: 'box', position: [6.9, 1, 0], size: [0.1, 1, 1.2] }, { type: 'box', position: [9.1, 1, 0], size: [0.1, 1, 1.2] },
+    { type: 'box', position: [8, 1, -1.1], size: [1.2, 1, 0.1] }, { type: 'box', position: [8, 1, 1.1], size: [1.2, 1, 0.1] }]);
   const n0 = block(sim, [8, 0.6, 0], [1, 0.6, 1]);
   const R = { min: [-3, 0, -3], max: [3, 4, 3] };
   let spawned = 0, drained = 0;

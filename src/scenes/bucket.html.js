@@ -43,7 +43,7 @@ const spacing = { low: 0.07, medium: 0.05, high: 0.04 }[qp.get('quality') ?? 'me
 const water = await createWater({
   renderer: harness.renderer, scene, b3, world,
   quality: qp.get('quality') ?? 'medium',
-  render: qp.get('render') ?? 'screen',
+  render: qp.get('render') ?? 'screen', backend: qp.get('backend') ?? 'cpu',
   params: { spacing, maxParticles: 32768, bounds: { min: [-3.5, -0.5, -3.5], max: [3.5, 4.5, 3.5] } },
 });
 const probe = fillProbe(water, { min: [-BW, 0, -BW], max: [BW, BH, BW] });

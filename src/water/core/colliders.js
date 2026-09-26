@@ -28,8 +28,9 @@ export const SHAPE = {
 export const F = {
   type: 0, px: 1, py: 2, pz: 3, qx: 4, qy: 5, qz: 6, qw: 7,
   sa: 8, sb: 9, sc: 10, vx: 11, vy: 12, vz: 13, wx: 14, wy: 15, wz: 16,
-  friction: 17, flags: 18, hf: 19, slot: 20, mass: 21, alpha: 22,
+  friction: 17, flags: 18, hf: 19, slot: 20, mass: 21, alpha: 22, bound: 23,
 };
+const UNBOUNDED = 1e30;
 
 export const FLAG_DYNAMIC = 1; // accumulate fluid impulses for rigid-body coupling
 
@@ -72,6 +73,21 @@ export function writeCollider(records, i, desc) {
   records[o + F.slot] = slot;
   records[o + F.mass] = desc.mass ?? 0;
   records[o + F.alpha] = 1;
+  // bounding radius around the position (quick reject); planes, containers
+  // and terrain are unbounded
+  const a = records[o + F.sa], b = records[o + F.sb], c = records[o + F.sc];
+  records[o + F.bound] = type === SHAPE.sphere ? a
+    : type === SHAPE.capsule ? a + b
+      : type === SHAPE.box ? Math.sqrt(a * a + b * b + c * c)
+        : UNBOUNDED;
+}
+
+/** Can collider i be within `reach` of (x,y,z)? (bounding-sphere test) */
+export function colliderNear(records, i, x, y, z, reach) {
+  const o = i * COLLIDER_STRIDE, r = records[o + F.bound] + reach;
+  if (r >= UNBOUNDED) return true;
+  const dx = x - records[o + F.px], dy = y - records[o + F.py], dz = z - records[o + F.pz];
+  return dx * dx + dy * dy + dz * dz < r * r;
 }
 
 // q · v (unit quaternion rotation), written into out[0..2]
@@ -139,6 +155,29 @@ export function colliderSDF(records, i, heightfields, x, y, z, out) {
   rotate(qx, qy, qz, qw, _n[0], _n[1], _n[2], out);
   return d;
 }
+
+/**
+ * The five walls of container i as half-spaces: distance from (x,y,z) to each
+ * wall plane (positive on the fluid side) into d[0..4] and each wall's
+ * fluid-side world normal into n[0..14]. Solvers that sum boundary volume
+ * per wall use this instead of the nearest-wall SDF, which under-counts the
+ * wall where two walls meet and flips its normal discontinuously there.
+ */
+export function containerWalls(records, i, x, y, z, d, n) {
+  const o = i * COLLIDER_STRIDE;
+  const cx = records[o + 1], cy = records[o + 2], cz = records[o + 3];
+  const qx = records[o + 4], qy = records[o + 5], qz = records[o + 6], qw = records[o + 7];
+  rotate(-qx, -qy, -qz, qw, x - cx, y - cy, z - cz, _l);
+  const lx = _l[0], ly = _l[1], lz = _l[2];
+  const ex = records[o + 8], ey = records[o + 9], ez = records[o + 10];
+  d[0] = ex - lx; d[1] = ex + lx; d[2] = ez - lz; d[3] = ez + lz; d[4] = ey + ly;
+  for (let w = 0; w < 5; w++) {
+    const a = WALL_N[w];
+    rotate(qx, qy, qz, qw, a[0], a[1], a[2], _n);
+    n[w * 3] = _n[0]; n[w * 3 + 1] = _n[1]; n[w * 3 + 2] = _n[2];
+  }
+}
+const WALL_N = [[-1, 0, 0], [1, 0, 0], [0, 0, -1], [0, 0, 1], [0, 1, 0]];
 
 // Exact box SDF with outward gradient (local space).
 function boxSDF(lx, ly, lz, ex, ey, ez, n) {

@@ -58,7 +58,7 @@ const quality = qp.get('quality') ?? 'medium';
 const spacing = { low: 0.33, medium: 0.25, high: 0.2 }[quality] ?? 0.25;
 const water = await createWater({
   renderer: harness.renderer, scene, quality,
-  render: qp.get('render') ?? 'screen',
+  render: qp.get('render') ?? 'screen', backend: qp.get('backend') ?? 'cpu',
   params: { spacing, maxParticles: 65536, bounds: { min: [-16, -1, -10], max: [16, 8, 10] } },
   colliders: [
     { type: 'plane', position: [0, 0, 0] },

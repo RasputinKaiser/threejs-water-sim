@@ -84,9 +84,11 @@ uniform float uSigmaR;     // depth range sigma (m)
 uniform float uRecip;      // 1: input holds 1/z
 uniform float uRadiusPx;   // footprint radius in texels at z = 1 m
 varying vec2 vUv;
+// depth in metres, 0 where there is no water (or the texel is not finite)
 float readZ(vec2 uv) {
   float v = texture2D(uTex, uv).r;
-  return uRecip > 0.5 ? (v > 0.0 ? 1.0 / v : 0.0) : v;
+  if (uRecip > 0.5) return v > 1e-4 ? 1.0 / v : 0.0;
+  return (v > 0.0 && v < 1e4) ? v : 0.0;
 }
 void main() {
   float d0 = readZ(vUv);
@@ -109,11 +111,16 @@ void main() {
   gl_FragColor = vec4(mix(d, pv, uTemporal), 0.0, 0.0, 1.0);
 }`;
 
+// A neighbor more than uMaxJump away in depth is across a silhouette (water
+// seen edge-on, a sheet in front of a pool): differencing across it gives a
+// degenerate or flipped normal — NaN after normalize(), which blanked
+// single-texel columns along far banks. Such neighbors count as missing.
 const NORMAL_FS = /* glsl */`
 precision highp float;
 uniform sampler2D uTex;
 uniform vec2 uTexel;
 uniform vec2 uInvProj;
+uniform float uMaxJump;
 varying vec2 vUv;
 vec3 viewPos(vec2 uv, float z) { return vec3((uv * 2.0 - 1.0) * uInvProj * z, -z); }
 void main() {
@@ -122,14 +129,20 @@ void main() {
   vec2 ox = vec2(uTexel.x, 0.0), oy = vec2(0.0, uTexel.y);
   float zl = texture2D(uTex, vUv - ox).r, zr = texture2D(uTex, vUv + ox).r;
   float zb = texture2D(uTex, vUv - oy).r, zt = texture2D(uTex, vUv + oy).r;
+  bool okL = zl > 0.0 && abs(zl - z0) < uMaxJump, okR = zr > 0.0 && abs(zr - z0) < uMaxJump;
+  bool okB = zb > 0.0 && abs(zb - z0) < uMaxJump, okT = zt > 0.0 && abs(zt - z0) < uMaxJump;
   vec3 p0 = viewPos(vUv, z0);
   vec3 dx = vec3(2.0 * uTexel.x * uInvProj.x * z0, 0.0, 0.0);
-  if (zr > 0.0 && (zl <= 0.0 || abs(zr - z0) < abs(z0 - zl))) dx = viewPos(vUv + ox, zr) - p0;
-  else if (zl > 0.0) dx = p0 - viewPos(vUv - ox, zl);
+  if (okR && (!okL || abs(zr - z0) < abs(z0 - zl))) dx = viewPos(vUv + ox, zr) - p0;
+  else if (okL) dx = p0 - viewPos(vUv - ox, zl);
   vec3 dy = vec3(0.0, 2.0 * uTexel.y * uInvProj.y * z0, 0.0);
-  if (zt > 0.0 && (zb <= 0.0 || abs(zt - z0) < abs(z0 - zb))) dy = viewPos(vUv + oy, zt) - p0;
-  else if (zb > 0.0) dy = p0 - viewPos(vUv - oy, zb);
-  gl_FragColor = vec4(normalize(cross(dx, dy)), 1.0);
+  if (okT && (!okB || abs(zt - z0) < abs(z0 - zb))) dy = viewPos(vUv + oy, zt) - p0;
+  else if (okB) dy = p0 - viewPos(vUv - oy, zb);
+  vec3 n = cross(dx, dy);
+  float l = length(n);
+  n = l > 1e-12 ? n / l : vec3(0.0, 0.0, 1.0);
+  if (n.z < 0.0) n = -n; // a visible surface faces the camera
+  gl_FragColor = vec4(n, 1.0);
 }`;
 
 // Composite (ShaderMaterial: three prepends tone mapping + colour space code).
@@ -178,8 +191,8 @@ float sceneDepth(vec2 uv) {
 
 void tapWater(vec2 uv, float w, inout float z, inout vec3 n, inout float cov) {
   float d = texture2D(tDepth, uv).r;
-  float k = d > 0.0 ? w : 0.0;
-  z += d * k; n += texture2D(tNormal, uv).xyz * k; cov += k;
+  // accumulate valid texels only (NaN · 0 would still poison the sum)
+  if (d > 0.0 && d < 1e4) { z += d * w; n += texture2D(tNormal, uv).xyz * w; cov += w; }
 }
 
 vec3 environment(vec3 dirWorld) {
@@ -205,7 +218,8 @@ void main() {
   vec3 color = scene;
   if (cov > 0.02) {
     wz /= cov;
-    vec3 n = normalize(nsum);
+    float nl = length(nsum);
+    vec3 n = nl > 1e-6 ? nsum / nl : vec3(0.0, 0.0, 1.0);
     vec3 V = -normalize(vec3((vUv * 2.0 - 1.0) * uInvProj, -1.0));
     float sd = sceneDepth(vUv);
     float thickRaw = texture2D(tThick, vUv).r;
@@ -221,8 +235,10 @@ void main() {
     below = mix(below, uScatterColor, (1.0 - (T.r + T.g + T.b) / 3.0) * uScatter);
     float cosT = clamp(dot(n, V), 0.0, 1.0);
     float fres = uF0 + (1.0 - uF0) * pow(1.0 - cosT, 5.0);
-    vec3 R = uViewToWorld * reflect(-V, n);
-    vec3 refl = environment(normalize(R));
+    vec3 R = normalize(uViewToWorld * reflect(-V, n));
+    // near and below the horizon a reflected ray would hit the banks, not
+    // the sky (whose filtered lower hemisphere is black): use the scene
+    vec3 refl = mix(scene, environment(R), smoothstep(-0.05, 0.25, R.y));
     vec3 H = normalize(uSunDirView + V);
     float shin = 2.0 / max(uRoughness * uRoughness, 1e-4) - 2.0;
     float spec = pow(max(dot(n, H), 0.0), shin) * (shin + 8.0) / 25.13;
@@ -232,13 +248,107 @@ void main() {
     float solid = smoothstep(0.0, uThinCut, thickRaw);
     float a = occl * edge * solid * smoothstep(0.02, 0.5, cov);
     color = mix(scene, water, a);
+    if (any(isnan(color))) color = scene; // never a black texel
+#if DEBUG_VIEW == 1
+    color = vec3(fract(wz), fract(wz * 10.0), 0.0);
+#elif DEBUG_VIEW == 2
+    color = n * 0.5 + 0.5;
+#elif DEBUG_VIEW == 3
+    color = vec3(thickRaw, L, 0.0);
+#elif DEBUG_VIEW == 4
+    color = vec3(cov, a, occl);
+#elif DEBUG_VIEW == 5
+    // NaN finder: red water depth, green path length / thickness, blue scene
+    // depth, white scene colour, magenta scene Inf, yellow shading NaN/Inf;
+    // grey where all are finite
+    color = vec3(isnan(wz) ? 1.0 : 0.0, (isnan(L) || isnan(thickRaw)) ? 1.0 : 0.0, isnan(sd) ? 1.0 : 0.0);
+    if (any(isnan(scene))) color = vec3(1.0);
+    if (any(isinf(scene))) color = vec3(1.0, 0.0, 1.0);
+    if (any(isinf(water)) || any(isnan(water))) color = vec3(1.0, 1.0, 0.0);
+    if (color == vec3(0.0)) color = vec3(0.15);
+#endif
   }
+#if DEBUG_VIEW > 0
+  else color = vec3(0.0, 0.0, 0.3);
+  gl_FragColor = vec4(color, 1.0);
+  return;
+#endif
   gl_FragColor = vec4(color, 1.0);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
 }`;
 
+// Whitewater sprites. `diff.w` = type (0 spray, 1 foam, 2 bubble) + fade.
+const WW_VS = /* glsl */`
+precision highp float;
+attribute vec4 diff;
+uniform mat4 viewMatrix;
+uniform mat4 projectionMatrix;
+uniform float uProj11, uViewportH;
+uniform vec3 uSize;          // world radius per type
+uniform vec3 uOpacity;       // opacity per type
+uniform float uPass;         // 0: bubbles only, 1: spray + foam
+varying float vAlpha;
+varying float vType;
+varying float vZ;
+varying float vSeed;
+void main() {
+  float type = floor(diff.w);
+  float fade = fract(diff.w) / 0.999;
+  vType = type;
+  bool bubble = type > 1.5;
+  if ((uPass < 0.5) != bubble || fade <= 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
+  vec4 mv = viewMatrix * vec4(diff.xyz, 1.0);
+  vZ = -mv.z;
+  float r = type < 0.5 ? uSize.x : type < 1.5 ? uSize.y : uSize.z;
+  float o = type < 0.5 ? uOpacity.x : type < 1.5 ? uOpacity.y : uOpacity.z;
+  vAlpha = o * fade;
+  vSeed = fract(sin(dot(diff.xyz, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+  gl_PointSize = clamp(2.0 * r * uProj11 * uViewportH * 0.5 / max(vZ, 0.05), 1.0, 64.0);
+  gl_Position = projectionMatrix * mv;
+}`;
+
+const WW_FS = /* glsl */`
+precision highp float;
+uniform sampler2D tSceneDepth;
+uniform sampler2D tWaterDepth;
+uniform vec2 uScreen;         // drawing buffer size (px)
+uniform float uNear, uFar;
+uniform float uManualDepth;   // 1: test against scene + water depth textures
+uniform float uFoamDepth;     // how far below the water surface foam still shows (m)
+uniform vec3 uColor;
+varying float vAlpha;
+varying float vType;
+varying float vZ;
+varying float vSeed;
+float sceneZ(vec2 uv) {
+  float z = texture2D(tSceneDepth, uv).x;
+  if (z >= 1.0) return 1e6;
+  float ndc = z * 2.0 - 1.0;
+  return (2.0 * uNear * uFar) / (uFar + uNear - ndc * (uFar - uNear));
+}
+void main() {
+  vec2 p = gl_PointCoord * 2.0 - 1.0;
+  float r2 = dot(p, p);
+  if (r2 > 1.0) discard;
+  float a = vAlpha * (1.0 - smoothstep(0.35 + 0.3 * vSeed, 1.0, r2));
+  if (uManualDepth > 0.5) {
+    vec2 uv = gl_FragCoord.xy / uScreen;
+    if (vZ > sceneZ(uv) + 0.02) discard;
+    float wz = texture2D(tWaterDepth, uv).r;
+    if (wz > 0.0 && vZ > wz + uFoamDepth) discard;
+    // foam just under the surface reads fainter
+    if (wz > 0.0 && vZ > wz) a *= 1.0 - (vZ - wz) / uFoamDepth;
+  }
+  // bubbles: bright rims; foam/spray: soft white
+  vec3 c = uColor * (vType > 1.5 ? (0.7 + 0.5 * smoothstep(0.3, 0.9, r2)) : (0.92 + 0.08 * vSeed));
+  gl_FragColor = vec4(c * a, a);
+}`;
+
 /* ------------------------------ renderer ------------------------------ */
+
+// per-type look values (spray, foam, bubble) accept one number for all three
+const vec3Of = (v) => (typeof v === 'number' ? [v, v, v] : v);
 
 const DEFAULT_LOOK = {
   resolution: 0.5,
@@ -257,6 +367,10 @@ const DEFAULT_LOOK = {
   sunIntensity: 1.0,
   edgeSoft: 0.06,
   thinCut: 0.35,
+  // whitewater: sprite radius (× spacing) and opacity per type
+  foamSize: [0.25, 0.55, 0.22],     // spray, foam, bubble
+  foamOpacity: [0.7, 0.45, 0.35],
+  foamColor: [0.95, 0.97, 1.0],
 };
 
 /**
@@ -267,7 +381,7 @@ const DEFAULT_LOOK = {
  *   capacity        max particles
  *   look            DEFAULT_LOOK overrides
  */
-export function createScreenSpaceRenderer({ renderer, particleRadius, spacing, capacity, look = {} }) {
+export function createScreenSpaceRenderer({ renderer, particleRadius, spacing, capacity, diffuseCapacity = 0, look = {} }) {
   const L = { ...DEFAULT_LOOK, ...look };
   const size = renderer.getDrawingBufferSize(new THREE.Vector2());
   const cur = new THREE.Vector2();
@@ -278,11 +392,15 @@ export function createScreenSpaceRenderer({ renderer, particleRadius, spacing, c
     minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
     depthBuffer: false, stencilBuffer: false, generateMipmaps: false,
   };
-  const rtDepth = new THREE.WebGLRenderTarget(1, 1, halfOpts);
+  // depth chain: every read is texel-exact (the composite upsamples by hand,
+  // weighting valid texels only). Linear filtering would blend a surface with
+  // an empty texel into a tiny 1/z whose reciprocal overflows — NaN downstream.
+  const depthOpts = { ...halfOpts, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter };
+  const rtDepth = new THREE.WebGLRenderTarget(1, 1, depthOpts);
   const rtThick = new THREE.WebGLRenderTarget(1, 1, halfOpts);
-  const rtTemp = new THREE.WebGLRenderTarget(1, 1, halfOpts);
-  let rtSmooth = new THREE.WebGLRenderTarget(1, 1, halfOpts);
-  let rtHist = new THREE.WebGLRenderTarget(1, 1, halfOpts);
+  const rtTemp = new THREE.WebGLRenderTarget(1, 1, depthOpts);
+  let rtSmooth = new THREE.WebGLRenderTarget(1, 1, depthOpts);
+  let rtHist = new THREE.WebGLRenderTarget(1, 1, depthOpts);
   const rtNormal = new THREE.WebGLRenderTarget(1, 1, halfOpts);
   // full-resolution linear HDR scene colour + depth
   const sceneRT = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, depthBuffer: true, samples: 0 });
@@ -323,7 +441,7 @@ export function createScreenSpaceRenderer({ renderer, particleRadius, spacing, c
   });
   const normalMat = new THREE.RawShaderMaterial({
     vertexShader: QUAD_VS, fragmentShader: NORMAL_FS, depthTest: false, depthWrite: false,
-    uniforms: { uTex: { value: null }, uTexel: { value: texel }, uInvProj: { value: invProj } },
+    uniforms: { uTex: { value: null }, uTexel: { value: texel }, uInvProj: { value: invProj }, uMaxJump: { value: 4 * particleRadius } },
   });
   // thickness calibration: a slab L metres thick accumulates
   // L/s³ · π·F² · w̄ of splat weight (F = footprint, w̄ = mean splat weight)
@@ -348,6 +466,39 @@ export function createScreenSpaceRenderer({ renderer, particleRadius, spacing, c
     },
   });
   compMat.toneMapped = true;
+  // look.debugView: 0 shaded, 1 water depth, 2 normals, 3 thickness, 4 coverage, 5 NaN finder
+  compMat.defines.DEBUG_VIEW = L.debugView ?? 0;
+
+  // whitewater points: bubbles into the scene target (seen through the water),
+  // spray + foam over the composite
+  const wwAttr = new THREE.BufferAttribute(new Float32Array(Math.max(1, diffuseCapacity) * 4), 4);
+  wwAttr.setUsage(THREE.DynamicDrawUsage);
+  const wwGeo = new THREE.BufferGeometry();
+  wwGeo.setAttribute('diff', wwAttr);
+  wwGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(3), 3)); // three needs one
+  wwGeo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), Infinity);
+  wwGeo.setDrawRange(0, 0);
+  const wwUniforms = (pass, manual) => ({
+    uProj11: pointUniforms.uProj11, uViewportH: { value: 1 },
+    uSize: { value: new THREE.Vector3(...vec3Of(L.foamSize)).multiplyScalar(spacing) },
+    uOpacity: { value: new THREE.Vector3(...vec3Of(L.foamOpacity)) },
+    uPass: { value: pass }, uManualDepth: { value: manual },
+    tSceneDepth: { value: sceneRT.depthTexture }, tWaterDepth: { value: null },
+    uScreen: { value: new THREE.Vector2(1, 1) }, uNear: { value: 0.1 }, uFar: { value: 1000 },
+    uFoamDepth: { value: 1.5 * spacing },
+    uColor: { value: new THREE.Color(...L.foamColor) },
+  });
+  const wwMat = (pass, manual) => new THREE.RawShaderMaterial({
+    vertexShader: WW_VS, fragmentShader: WW_FS, uniforms: wwUniforms(pass, manual),
+    transparent: true, depthWrite: false, depthTest: !manual,
+    blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
+  });
+  const bubblePoints = new THREE.Points(wwGeo, wwMat(0, 0));
+  const foamPoints = new THREE.Points(wwGeo, wwMat(1, 1));
+  bubblePoints.frustumCulled = foamPoints.frustumCulled = false;
+  const bubbleScene = new THREE.Scene(); bubbleScene.add(bubblePoints);
+  const foamScene = new THREE.Scene(); foamScene.add(foamPoints);
+  let diffuseCount = 0;
 
   const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2));
   quad.frustumCulled = false;
@@ -432,6 +583,12 @@ export function createScreenSpaceRenderer({ renderer, particleRadius, spacing, c
     u.uRoughness.value = L.roughness; u.uEnvIntensity.value = L.envIntensity;
     u.uEdgeSoft.value = L.edgeSoft; u.uThinCut.value = L.thinCut;
     blurMat.uniforms.uSigmaR.value = L.blurSigma * particleRadius;
+    for (const m of [bubblePoints.material, foamPoints.material]) {
+      m.uniforms.uSize.value.set(...vec3Of(L.foamSize)).multiplyScalar(spacing);
+      m.uniforms.uOpacity.value.set(...vec3Of(L.foamOpacity));
+      m.uniforms.uColor.value.setRGB(...L.foamColor);
+    }
+    if ('debugView' in patch) { compMat.defines.DEBUG_VIEW = L.debugView; compMat.needsUpdate = true; }
     if ('resolution' in patch) W = 1; // re-allocate targets on the next render
   }
 
@@ -448,6 +605,17 @@ export function createScreenSpaceRenderer({ renderer, particleRadius, spacing, c
       positions.needsUpdate = true;
       pointsGeo.setDrawRange(0, count);
     },
+    /** Whitewater for this frame: packed [x y z type+fade] × n (see core/whitewater.js). */
+    setDiffuse(data, n) {
+      diffuseCount = Math.min(n, diffuseCapacity);
+      if (diffuseCount > 0) {
+        wwAttr.array.set(data.subarray(0, diffuseCount * 4));
+        wwAttr.clearUpdateRanges();
+        wwAttr.addUpdateRange(0, diffuseCount * 4);
+        wwAttr.needsUpdate = true;
+      }
+      wwGeo.setDrawRange(0, diffuseCount);
+    },
     /** Render `scene` with water to `target` (default: the canvas). */
     render(scene, camera, target = null) {
       resize();
@@ -461,6 +629,15 @@ export function createScreenSpaceRenderer({ renderer, particleRadius, spacing, c
       renderer.render(scene, camera);
       const u = compMat.uniforms;
       const e = camera.projectionMatrix.elements;
+      if (diffuseCount > 0) {
+        // bubbles are part of what the water refracts and absorbs
+        const bu = bubblePoints.material.uniforms;
+        bu.uViewportH.value = size.y;
+        pointUniforms.uProj11.value = e[5];
+        renderer.autoClear = false;
+        renderer.render(bubbleScene, camera);
+        renderer.autoClear = prevAuto;
+      }
       invProj.set(1 / e[0], 1 / e[5]);
       u.uNear.value = camera.near; u.uFar.value = camera.far;
       u.uViewToWorld.value.setFromMatrix4(camera.matrixWorld);
@@ -496,6 +673,21 @@ export function createScreenSpaceRenderer({ renderer, particleRadius, spacing, c
       u.tDepth.value = depthTex ?? rtDepth.texture;
       if (!depthTex) { renderer.setRenderTarget(rtDepth); renderer.setClearColor(clear.setRGB(0, 0, 0), 0); renderer.clear(true, false, false); }
       blit(compMat, target);
+      if (diffuseCount > 0) {
+        // spray + foam over the composite, depth-tested by hand against the
+        // scene depth and the water surface (foam shows only near it)
+        const fu = foamPoints.material.uniforms;
+        const vp = target ? [target.width, target.height] : [size.x, size.y];
+        fu.uViewportH.value = vp[1]; fu.uScreen.value.set(vp[0], vp[1]);
+        fu.uNear.value = camera.near; fu.uFar.value = camera.far;
+        fu.tWaterDepth.value = depthTex;
+        fu.uManualDepth.value = 1;
+        pointUniforms.uProj11.value = e[5];
+        renderer.autoClear = false;
+        renderer.setRenderTarget(target);
+        renderer.render(foamScene, camera);
+        renderer.autoClear = prevAuto;
+      }
       renderer.setRenderTarget(prevTarget);
       renderer.autoClear = prevAuto;
       renderer.setClearColor(prevClear, prevAlpha);
@@ -503,8 +695,9 @@ export function createScreenSpaceRenderer({ renderer, particleRadius, spacing, c
     dispose() {
       for (const rt of [rtDepth, rtThick, rtTemp, rtSmooth, rtHist, rtNormal, sceneRT]) rt.dispose();
       pmremTarget?.dispose(); pmrem?.dispose();
-      pointsGeo.dispose(); quad.geometry.dispose();
-      for (const m of [depthPoints.material, thickPoints.material, blurMat, normalMat, compMat]) m.dispose();
+      pointsGeo.dispose(); quad.geometry.dispose(); wwGeo.dispose();
+      for (const m of [depthPoints.material, thickPoints.material, blurMat, normalMat, compMat,
+        bubblePoints.material, foamPoints.material]) m.dispose();
     },
   };
 }

@@ -17,7 +17,9 @@
 // always per particle. Use `ids` for identity across frames.
 
 import { deriveParams } from './core/params.js';
-import { PBFSolver, allocateBuffers, H, U } from './core/solver.js';
+import { allocateBuffers, solverStats, H } from './core/fluid-core.js';
+import { createSolver } from './core/create-solver.js';
+import { packWhitewater } from './core/whitewater.js';
 import { COLLIDER_STRIDE, writeCollider, packHeightfield } from './core/colliders.js';
 import { CTL_SIZE } from './core/threads.js';
 import { mulberry32 } from 'math/random';
@@ -43,9 +45,23 @@ function defaultThreads() {
  *   fixedDt          solver step (s), default 1/60
  *   maxStepsPerFrame default 3
  *   workerFactory    () => Worker-like; default: a module Worker on core/worker.js
+ *   backend          'cpu' (default) | 'gpu' | 'auto' — WebGPU compute (DFSPH)
  */
 export async function createSimulation(params = {}, opts = {}) {
   const dp = deriveParams(params);
+  // WebGPU compute (DFSPH only); 'auto' falls back to the CPU when unavailable
+  const backend = opts.backend ?? 'cpu';
+  if ((backend === 'gpu' || backend === 'auto') && dp.solver === 'dfsph' && globalThis.navigator?.gpu) {
+    const { createGPUSimulation } = await import('./gpu/gpu-sim.js');
+    const gpu = await createGPUSimulation(dp, opts).catch((e) => {
+      if (backend === 'gpu') throw e;
+      console.warn('water: WebGPU backend unavailable, using the CPU', e);
+      return null;
+    });
+    if (gpu) return gpu;
+  } else if (backend === 'gpu') {
+    throw new Error('water: backend "gpu" needs WebGPU and solver "dfsph"');
+  }
   const threads = opts.threads === 'auto' || opts.threads == null ? defaultThreads() : opts.threads;
   const useThreads = threads > 0 && threadsAvailable();
   const sim = useThreads ? await createThreaded(dp, threads, opts) : createInline(dp, opts);
@@ -54,7 +70,7 @@ export async function createSimulation(params = {}, opts = {}) {
 
 /* ============================== shared ============================== */
 
-function makeBase(dp, opts) {
+export function makeBase(dp, opts) {
   const fixedDt = opts.fixedDt ?? 1 / 60;
   const maxSteps = opts.maxStepsPerFrame ?? 3;
   const maxColliders = opts.maxColliders ?? 64;
@@ -96,7 +112,7 @@ export function latticeBox(dp, min, max, { velocity = [0, 0, 0], jitter = 0.01, 
   return out;
 }
 
-function toSpawnArray(particles) {
+export function toSpawnArray(particles) {
   if (particles instanceof Float32Array) return particles;
   const out = new Float32Array(particles.length * 6);
   particles.forEach((p, i) => {
@@ -106,7 +122,7 @@ function toSpawnArray(particles) {
   return out;
 }
 
-function interpolateInto(out, prev, cur, n, alpha) {
+export function interpolateInto(out, prev, cur, n, alpha) {
   const m = n * 3;
   if (alpha >= 1) { out.set(cur.subarray(0, m)); return out; }
   for (let i = 0; i < m; i++) out[i] = prev[i] + (cur[i] - prev[i]) * alpha;
@@ -119,7 +135,8 @@ function createInline(dp, opts) {
   const base = makeBase(dp, opts);
   const heightfields = [];
   const buffers = allocateBuffers(dp, { maxColliders: base.maxColliders });
-  const solver = new PBFSolver(dp, buffers, { heightfields });
+  const solver = createSolver(dp, buffers, { heightfields });
+  const diffusePacked = new Float32Array((buffers.D || 0) * 4);
   const impulses = new Float64Array(base.maxColliders * 6);
   const scratch = new Float64Array(base.maxColliders * 6);
   let impulseTime = 0;
@@ -153,10 +170,11 @@ function createInline(dp, opts) {
     get ids() { return solver.id; },
     get alpha() { return base.alpha; },
     get stepMs() { return lastMs; },
-    get stats() {
-      const u = solver.u, h = solver.header;
-      return { kineticEnergy: u[U.kineticEnergy], maxDensityError: u[U.maxDensityError], overflow: h[H.overflow],
-        leaked: h[H.leaked], quarantined: h[H.quarantined], drained: h[H.drained] };
+    get stats() { return solverStats(solver); },
+    /** Whitewater: { count, data: [x y z type+alpha]* } (packed on each read). */
+    get diffuse() {
+      const m = solver.D ? solver.header[H.diffuse] : 0;
+      return { count: m ? packWhitewater(solver.diffuse, m, diffusePacked) : 0, data: diffusePacked };
     },
     /**
      * Per-slot fluid impulses [Jx,Jy,Jz, Lx,Ly,Lz] (N·s, moments about the
@@ -213,24 +231,29 @@ async function createThreaded(dp, K, opts) {
   const N = dp.maxParticles;
   const ctl = sab(CTL_SIZE * 4);
   const staging = sab(base.maxColliders * COLLIDER_STRIDE * 4);
+  const D = buffers.D;
   const pubBuf = {
-    header: sab(16), pos: sab(2 * N * 3 * 4), prev: sab(2 * N * 3 * 4),
+    header: sab(32), pos: sab(2 * N * 3 * 4), prev: sab(2 * N * 3 * 4),
     vel: sab(2 * N * 3 * 4), nbr: sab(2 * N * 4), id: sab(2 * N * 4),
+    diffuse: sab(2 * D * 4 * 4), // whitewater, packed [x y z type+alpha]
   };
   const pub = {
     header: new Int32Array(pubBuf.header),
     pos: new Float32Array(pubBuf.pos), prev: new Float32Array(pubBuf.prev),
     vel: new Float32Array(pubBuf.vel), nbr: new Int32Array(pubBuf.nbr), id: new Int32Array(pubBuf.id),
+    diffuse: new Float32Array(pubBuf.diffuse),
   };
   // The active half is LATCHED once per update(): count and every array view
   // then come from the same published frame even if the worker flips halves
   // meanwhile (reading them through separate Atomics loads raced with the
   // flip and mixed a new count with the other half's stale positions).
-  let latched = 0, latchedCount = 0;
+  let latched = 0, latchedCount = 0, latchedDiffuse = 0;
   function latch() {
     latched = Atomics.load(pub.header, 0);
     latchedCount = Atomics.load(pub.header, 1 + latched);
+    latchedDiffuse = Atomics.load(pub.header, 4 + latched);
   }
+  const diffuseHalves = [pub.diffuse.subarray(0, D * 4), pub.diffuse.subarray(D * 4, 2 * D * 4)];
   const view = (arr, stride) => {
     const cache = [arr.subarray(0, N * stride), arr.subarray(N * stride, 2 * N * stride)];
     return () => cache[latched];
@@ -320,6 +343,8 @@ async function createThreaded(dp, K, opts) {
     get alpha() { return base.alpha; },
     get stepMs() { return lastMs; },
     get stats() { return lastStats; },
+    /** Whitewater of the latest frame: { count, data: [x y z type+alpha]* }. */
+    get diffuse() { return { count: latchedDiffuse, data: diffuseHalves[latched] }; },
     get busy() { return busy; },
     takeImpulses() {
       const t = impulseTime; impulseTime = 0;

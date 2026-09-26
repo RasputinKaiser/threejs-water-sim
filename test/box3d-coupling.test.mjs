@@ -113,3 +113,25 @@ test('a kinematic paddle pushes the water it sweeps through', async () => {
   for (let i = 0; i < sim.count; i++) px += sim.velocities[i * 3];
   assert.ok(px / sim.count > 0.1, `mean water x-velocity ${(px / sim.count).toFixed(3)} m/s`);
 });
+
+test('a current carries a floating log downstream (drag through the coupling)', async () => {
+  const world = makeWorld();
+  const d = b3.b3DefaultBodyDef();
+  d.type = b3.b3BodyType.b3_dynamicBody;
+  d.position = [-2.2, 0.45, 0];
+  const log = b3.b3CreateBody(world, d);
+  const sd = b3.b3DefaultShapeDef();
+  sd.density = 600;
+  b3.b3CreateCapsuleShape(log, sd, { center1: [0, 0, -0.25], center2: [0, 0, 0.25], radius: 0.1 });
+  const sim = await createSimulation({ spacing: 0.1, maxParticles: 12000 }, { threads: 0 });
+  const channel = { type: 'container', position: [0, 1, 0], size: [3, 1, 0.5] };
+  sim.fillBox([-3, 0, -0.5], [3, 0.4, 0.5], { jitter: 0, velocity: [1.5, 0, 0] });
+  const coupling = createBox3DCoupling({ sim, b3, world, colliders: [channel] });
+  const p = [0, 0, 0];
+  for (let f = 0; f < 60; f++) { coupling.update(); b3.b3World_Step(world, DT, 4); sim.update(DT); }
+  b3.b3Body_GetPosition(p, log);
+  sim.dispose();
+  // no push but the water's: the log started at rest
+  assert.ok(p[0] > -1.6, `log x after 1 s: ${p[0].toFixed(2)} m (start −2.2, water at 1.5 m/s)`);
+  assert.ok(p[1] > 0.2 && p[1] < 0.6, `log still floating (y ${p[1].toFixed(2)})`);
+});

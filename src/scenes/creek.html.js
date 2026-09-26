@@ -190,7 +190,7 @@ const spacing = { low: 0.18, medium: 0.15, high: 0.12 }[quality] ?? 0.15;
 const water = await createWater({
   renderer, scene, b3, world, quality,
   threads: qp.has('threads') ? Number(qp.get('threads')) : 'auto',
-  render: qp.get('render') ?? 'screen',
+  render: qp.get('render') ?? 'screen', backend: qp.get('backend') ?? 'cpu',
   params: {
     spacing, maxParticles: 65536, friction: 0.02, // gravel bed
     bounds: { min: [-20, -4, -12], max: [20, 6, 12] },

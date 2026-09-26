@@ -83,7 +83,7 @@ const water = await createWater({
   renderer, scene, b3, world,
   quality: qp.get('quality') ?? 'medium',
   params: { bounds: { min: [-6, -2, -6], max: [6, 10, 6] } },
-  render: qp.get('render') ?? 'screen',
+  render: qp.get('render') ?? 'screen', backend: qp.get('backend') ?? 'cpu',
 });
 water.fillBox([-P, 0, -P], [P, 0.5, P]);
 const nozzle = water.addSource({ position: [1.0, 2.4, 1.0], direction: [-0.3, -1, -0.2], radius: 0.12, speed: 3, enabled: qp.has('pour') });

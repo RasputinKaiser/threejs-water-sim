@@ -45,9 +45,23 @@ function defaultThreads() {
  *   fixedDt          solver step (s), default 1/60
  *   maxStepsPerFrame default 3
  *   workerFactory    () => Worker-like; default: a module Worker on core/worker.js
+ *   backend          'cpu' (default) | 'gpu' | 'auto' — WebGPU compute (DFSPH)
  */
 export async function createSimulation(params = {}, opts = {}) {
   const dp = deriveParams(params);
+  // WebGPU compute (DFSPH only); 'auto' falls back to the CPU when unavailable
+  const backend = opts.backend ?? 'cpu';
+  if ((backend === 'gpu' || backend === 'auto') && dp.solver === 'dfsph' && globalThis.navigator?.gpu) {
+    const { createGPUSimulation } = await import('./gpu/gpu-sim.js');
+    const gpu = await createGPUSimulation(dp, opts).catch((e) => {
+      if (backend === 'gpu') throw e;
+      console.warn('water: WebGPU backend unavailable, using the CPU', e);
+      return null;
+    });
+    if (gpu) return gpu;
+  } else if (backend === 'gpu') {
+    throw new Error('water: backend "gpu" needs WebGPU and solver "dfsph"');
+  }
   const threads = opts.threads === 'auto' || opts.threads == null ? defaultThreads() : opts.threads;
   const useThreads = threads > 0 && threadsAvailable();
   const sim = useThreads ? await createThreaded(dp, threads, opts) : createInline(dp, opts);
@@ -56,7 +70,7 @@ export async function createSimulation(params = {}, opts = {}) {
 
 /* ============================== shared ============================== */
 
-function makeBase(dp, opts) {
+export function makeBase(dp, opts) {
   const fixedDt = opts.fixedDt ?? 1 / 60;
   const maxSteps = opts.maxStepsPerFrame ?? 3;
   const maxColliders = opts.maxColliders ?? 64;
@@ -98,7 +112,7 @@ export function latticeBox(dp, min, max, { velocity = [0, 0, 0], jitter = 0.01, 
   return out;
 }
 
-function toSpawnArray(particles) {
+export function toSpawnArray(particles) {
   if (particles instanceof Float32Array) return particles;
   const out = new Float32Array(particles.length * 6);
   particles.forEach((p, i) => {
@@ -108,7 +122,7 @@ function toSpawnArray(particles) {
   return out;
 }
 
-function interpolateInto(out, prev, cur, n, alpha) {
+export function interpolateInto(out, prev, cur, n, alpha) {
   const m = n * 3;
   if (alpha >= 1) { out.set(cur.subarray(0, m)); return out; }
   for (let i = 0; i < m; i++) out[i] = prev[i] + (cur[i] - prev[i]) * alpha;

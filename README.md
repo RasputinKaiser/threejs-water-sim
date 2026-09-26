@@ -62,6 +62,19 @@ tolerance; `medium` 10 cm, 0.2%; `high` 8 cm, 0.1%. Override anything through
 `friction` is the walls' quadratic drag coefficient C_f (τ = ρ·C_f·|u|·u):
 ~0.003 smooth, ~0.01 gravel (default), ~0.03 boulders.
 
+**WebGPU** (`createWater({ backend: 'gpu' | 'auto' })`, DFSPH only): the same
+solver as compute shaders (`src/water/gpu/`) — hash grid rebuilt on the GPU
+every substep (atomic histogram, three-level scan, scatter; dead particles
+sort to the end), neighbour lists, warm-started pressure solves whose
+iteration count adapts to the density tolerance one frame late, the same SDF
+volume-map boundaries and bed drag, body impulses via fixed-point atomics.
+Positions are read back asynchronously (one frame, like the worker path) for
+the WebGL renderer and the Box3D coupling. Whitewater is CPU-only for now.
+`npm run gpu-check` (with the dev server running and `PLAYWRIGHT` pointing at
+a Playwright install) compares it with the CPU solver in headless Chromium:
+resting column 0.582 m mean height on both, 0.19% mean density error on both;
+buoyancy on a fixed sphere 1.057× (GPU) vs 1.065× (CPU) ρgV.
+
 **Threads** need `SharedArrayBuffer`, i.e. the page must be served with
 `Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp` (the Vite config here sets both).
@@ -126,7 +139,7 @@ compression.
 | `creek.html` — Creek | the main proving ground: a 40 m meander on a 2% grade (terrain and boulders in both Box3D and the solver), floating logs carried by the current, submerged inlet + outlet, whitewater, gauges for depth / speed / flow |
 | `water-lab.html` | the pack used without the debug harness, as a game would |
 
-URL params: `quality=low|medium|high`, `render=screen|points`, `pour`.
+URL params: `quality=low|medium|high`, `render=screen|points`, `backend=cpu|gpu`, `pour`.
 The labs share `src/scenes/water-harness.js` (fill probe, HUD, GUI).
 
 ### Debug tooling

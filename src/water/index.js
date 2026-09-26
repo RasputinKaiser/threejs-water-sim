@@ -45,17 +45,20 @@ export const QUALITY = {
  *   params            solver params (core/params.js) overriding the preset
  *   colliders         static solver colliders (planes, containers, heightfields…)
  *   threads           'auto' | n | 0 (main thread)
+ *   backend           'cpu' (default) | 'gpu' | 'auto' — WebGPU compute for the
+ *                     DFSPH solver ('auto': WebGPU when available); no
+ *                     whitewater on the GPU yet
  *   render            'screen' (default) | 'points' | false; look overrides in `look`
  *   workerFactory     custom Worker constructor (bundlers without module workers, tests)
  */
 export async function createWater({
   renderer = null, scene = null, b3 = null, world = null,
   quality = 'medium', params = {}, colliders = [], threads = 'auto',
-  render = 'screen', look = {}, workerFactory, fixedDt, maxStepsPerFrame, maxColliders,
+  render = 'screen', look = {}, workerFactory, fixedDt, maxStepsPerFrame, maxColliders, backend = 'cpu',
 } = {}) {
   const preset = QUALITY[quality] ?? QUALITY.medium;
   const sim = await createSimulation({ ...preset, ...params }, {
-    threads, workerFactory, fixedDt, maxStepsPerFrame, maxColliders,
+    threads, workerFactory, fixedDt, maxStepsPerFrame, maxColliders, backend,
   });
   const dp = sim.params;
   let staticColliders = [...colliders];

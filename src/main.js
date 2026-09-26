@@ -85,7 +85,7 @@ if (qp.get('aabb') === '1') debugDraw.state.showAABBs = true;
 const water = await createWater({
   renderer: harness.renderer, scene, b3, world,
   quality: qp.get('quality') ?? 'medium',
-  render: qp.get('render') ?? 'screen',
+  render: qp.get('render') ?? 'screen', backend: qp.get('backend') ?? 'cpu',
   // particles leaving this box are removed (and counted as leaked)
   params: { bounds: { min: [-7, -0.5, -7], max: [7, 9, 7] } },
 });

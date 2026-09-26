@@ -75,6 +75,11 @@ function s1NanInjection(steps) {
   let finitePos = 0;
   for (let k = 0; k < sim.count * 3; k++) if (Number.isFinite(sim.pos[k])) finitePos++;
   const detail = `injections=${injectAt.length} finalCount=${sim.count} nonFinitePosEntries=${sim.count * 3 - finitePos}`;
+  // Containment: quarantine must cost only the injected particles. A NaN
+  // that reaches the pair walk spreads through densities to its neighbors
+  // (this once wiped out ~95% of the block while still reading as "finite").
+  const lost = 1000 - sim.count - (sim.leakedTotal ?? 0);
+  if (lost > injectAt.length) viols.push(`NaN spread: lost ${lost} particles to ${injectAt.length} injections`);
   return { violations: viols, detail };
 }
 

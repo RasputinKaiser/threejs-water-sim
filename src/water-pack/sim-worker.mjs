@@ -27,7 +27,8 @@
 //
 // Worker → main:
 //   {type:'ready', maxParticles}
-//   {type:'frame', frameId, count, simMs, leakedTotal, ke}   (simMs = worker-side step time)
+//   {type:'frame', frameId, count, simMs, leakedTotal, drainedTotal, ke}
+//                                                            (simMs = worker-side step time)
 //   {type:'debug', kind:'phases', batches, meanStepMs, perPhaseMs,
 //    pairsPerStep, dominant}                                 (every 30 batches)
 //
@@ -63,12 +64,9 @@
 // steadier posLerp cadence). Still bounded by the pacing debt + maxSteps
 // clamp, so sim time never outruns wall clock.
 //
-// PHASE PROFILING (Lane F2): the worker monkey-patches WaterSim.prototype's
-// phase methods (_buildGrid/_buildPairs/_viscosity/_relax/_collide) with
-// timed wrappers and brackets the instance `step` — solver.js itself is NOT
-// edited. Per-step phase split: gravity/predict = step entry → _buildGrid
-// entry; derive(+diagnostics) = _collide exit → step exit. Timings
-// accumulate across batches; every 30 completed batches the worker posts
+// PHASE PROFILING: WaterSim records per-phase wall time for every step in
+// sim.phaseMs (keys: solver.js PHASES). The worker accumulates them and every
+// 30 completed steps posts
 //   {type:'debug', kind:'phases', batches, meanStepMs, perPhaseMs:{...},
 //    pairsPerStep, dominant}
 // and resets its accumulators. async-sim.js stores the latest report on
@@ -85,10 +83,10 @@
 // Environment note: this module uses ONLY browser worker globals
 // (self/postMessage/addEventListener). For the headless Node test harness it
 // runs inside a worker_threads Worker whose bootstrap shims those globals onto
-// parentPort — see /tmp/test-async.mjs. No Node imports here, so vite bundles
+// parentPort — see test/helpers/worker-shim.mjs. No Node imports here, so vite bundles
 // it cleanly for the browser.
 
-import { WaterSim } from './solver.js';
+import { WaterSim, PHASES } from './solver.js';
 
 let sim = null;
 let ctl = null;
@@ -105,63 +103,26 @@ let emaStepMs = 0;        // EMA of measured per-step solve time (adaptive budge
 
 function post(msg) { postMessage(msg); }
 
-// ---- Lane F2: phase profiling (worker-side monkey-patch; solver.js untouched) ----
+// ---- phase profiling (reads the solver's own sim.phaseMs) ----
 const PHASE_REPORT_EVERY = 30;
-const PHASE_KEYS = ['gravity', 'grid', 'pairs', 'viscosity', 'relax', 'collide', 'derive'];
-// prototype method → accumulator key (called in solver.step order)
-const PHASE_METHODS = [
-  ['_buildGrid', 'grid'],
-  ['_buildPairs', 'pairs'],
-  ['_viscosity', 'viscosity'],
-  ['_relax', 'relax'],
-  ['_collide', 'collide'],
-];
-let prof = null; // accumulator object once installed
+let prof = null; // accumulator object
 
-function installProfiler(sim) {
-  const proto = Object.getPrototypeOf(sim);
-  const acc = {
-    steps: 0, totalMs: 0, npairs: 0,
-    gravity: 0, grid: 0, pairs: 0, viscosity: 0, relax: 0, collide: 0, derive: 0,
-  };
-  let cursor = 0; // timestamp where the currently-running phase began
+function resetProfiler() {
+  prof = { steps: 0, totalMs: 0, npairs: 0 };
+  for (const k of PHASES) prof[k] = 0;
+}
 
-  for (const [method, key] of PHASE_METHODS) {
-    const orig = proto[method];
-    proto[method] = function (...args) {
-      const enter = performance.now();
-      if (key === 'grid') {
-        // gravity/predict ran between the step bracket's t0 (or the previous
-        // phase exit) and _buildGrid entry — charge that window to `gravity`.
-        acc.gravity += enter - cursor;
-      }
-      const out = orig.apply(this, args);
-      const exit = performance.now();
-      acc[key] += exit - enter;
-      cursor = exit;
-      return out;
-    };
-  }
-
-  const origStep = sim.step;
-  sim.step = function (dt, cols) {
-    const t0 = performance.now();
-    cursor = t0;
-    try { return origStep.call(this, dt, cols); }
-    finally {
-      const tEnd = performance.now();
-      // derive (+ leak/KE diagnostics) runs after _collide exits.
-      acc.derive += tEnd - cursor;
-      acc.totalMs += tEnd - t0;
-      acc.steps++;
-      acc.npairs += this._npairs || 0;
-      // feed the adaptive-budget EMA with the real single-step solve time
-      emaStepMs = emaStepMs > 0 ? emaStepMs * 0.9 + (tEnd - t0) * 0.1 : tEnd - t0;
-      maybePostPhases();
-    }
-  };
-
-  prof = acc;
+/** One solver step + profiling/EMA bookkeeping. */
+function timedStep(dt) {
+  sim.step(dt, colliders);
+  const ms = sim.simMs;
+  for (const k of PHASES) prof[k] += sim.phaseMs[k];
+  prof.totalMs += ms;
+  prof.steps++;
+  prof.npairs += sim._npairs || 0;
+  // feed the adaptive-budget EMA with the real single-step solve time
+  emaStepMs = emaStepMs > 0 ? emaStepMs * 0.9 + ms * 0.1 : ms;
+  maybePostPhases();
 }
 
 function maybePostPhases() {
@@ -169,7 +130,7 @@ function maybePostPhases() {
   const n = prof.steps;
   const perPhaseMs = {};
   let dominant = null;
-  for (const k of PHASE_KEYS) {
+  for (const k of PHASES) {
     const v = prof[k] / n;
     perPhaseMs[k] = v;
     if (dominant === null || v > perPhaseMs[dominant]) dominant = k;
@@ -182,8 +143,7 @@ function maybePostPhases() {
     pairsPerStep: Math.round(prof.npairs / n),
     dominant,
   });
-  for (const k of PHASE_KEYS) prof[k] = 0;
-  prof.steps = 0; prof.totalMs = 0; prof.npairs = 0;
+  resetProfiler();
 }
 
 /**
@@ -225,7 +185,7 @@ self.addEventListener('message', (e) => {
       maxStepsPerBatch = Math.max(1, msg.maxStepsPerBatch ?? 3);
       maxBatchMs = msg.maxBatchMs != null ? Math.max(0, msg.maxBatchMs) : 12;
       emaStepMs = 0; // fresh EMA per sim (capacity/params may change step cost)
-      installProfiler(sim);
+      resetProfiler();
       if (msg.bounds) sim.bounds = msg.bounds;
       Atomics.store(ctl, 0, 0);
       Atomics.store(ctl, 2, 0);
@@ -267,7 +227,7 @@ self.addEventListener('message', (e) => {
           if (budget < steps) steps = budget;
         }
       }
-      for (let s = 0; s < steps; s++) sim.step(msg.dt, colliders);
+      for (let s = 0; s < steps; s++) timedStep(msg.dt);
       const simMs = performance.now() - t0;
       syncStateToSAB(true); // write inactive pos half + flip → new curr frame
       Atomics.store(ctl, 2, Math.round(simMs * 1000)); // µs precision, int cell
@@ -279,6 +239,7 @@ self.addEventListener('message', (e) => {
       post({
         type: 'frame', frameId, count: sim.count, simMs,
         leakedTotal: sim.leakedTotal ?? 0,
+        drainedTotal: sim.drainedTotal ?? 0,
         ke: sim.kineticEnergy ?? 0,
       });
       break;

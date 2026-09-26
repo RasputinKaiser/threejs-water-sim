@@ -1,14 +1,12 @@
 // src/water-pack/bench-report.mjs — perf headroom study for the CURRENT WaterSim.
-// Profiles phase-by-phase cost (gravity+predict, grid build, pair build,
-// viscosity, relax-displace, collide, velocity derive) at h=0.35 across
-// particle counts [8000, 14000, 22000, 26000, 30000].
-//
-// Does NOT modify solver.js: subclasses WaterSim and overrides step() with an
-// instrumented verbatim copy (phase bodies untouched — same code paths).
+// Profiles phase-by-phase cost (solver.js PHASES: predict, sort, pairs
+// (incl. density + viscosity), relax, scatter, collide, derive) at h=0.35
+// across particle counts [8000, 14000, 22000, 26000, 30000], using the
+// solver's own per-step sim.phaseMs timings.
 //
 // Run: node src/water-pack/bench-report.mjs
 
-import { WaterSim } from './solver.js';
+import { WaterSim, PHASES } from './solver.js';
 
 const H = 0.35;
 const COUNTS = [8000, 14000, 22000, 26000, 30000];
@@ -16,81 +14,6 @@ const WARMUP = 10;
 const TIMED = 60;
 const DT = 1 / 60;
 const COLLIDERS = [{ type: 'plane', o: [0, 0, 0], n: [0, 1, 0] }];
-
-class ProfiledWaterSim extends WaterSim {
-  // Instrumented copy of WaterSim.step(): identical math, phase timings added.
-  step(dt, colliders) {
-    const tAll0 = performance.now();
-    const p = this.pos, v = this.vel, pr = this.prev;
-    const n = this.count;
-    const g = this.p.gravity;
-
-    // 1. apply gravity + predict
-    let t0 = performance.now();
-    for (let i = 0; i < n; i++) {
-      v[i * 3 + 1] += g * dt;
-      pr[i * 3] = p[i * 3]; pr[i * 3 + 1] = p[i * 3 + 1]; pr[i * 3 + 2] = p[i * 3 + 2];
-      p[i * 3] += v[i * 3] * dt; p[i * 3 + 1] += v[i * 3 + 1] * dt; p[i * 3 + 2] += v[i * 3 + 2] * dt;
-    }
-    this._tGravity = performance.now() - t0;
-
-    // 2. neighbor search (flat grid)
-    t0 = performance.now();
-    this._buildGrid();
-    this._tGrid = performance.now() - t0;
-
-    // 3. shared pair list build (+ density scatter)
-    t0 = performance.now();
-    this._buildPairs();
-    this._tPairs = performance.now() - t0;
-
-    // 4. viscosity impulses off the shared pair list
-    t0 = performance.now();
-    this._viscosity(dt);
-    this._tVisc = performance.now() - t0;
-
-    // 5. double density relaxation off the same pair list
-    t0 = performance.now();
-    this._relax(dt);
-    this._tRelax = performance.now() - t0;
-
-    // 6. resolve collisions
-    t0 = performance.now();
-    this._collide(colliders, dt);
-    this._tCollide = performance.now() - t0;
-
-    // 7. derive velocities (clamped)
-    t0 = performance.now();
-    const invDt = 1 / dt;
-    const maxV = this.p.maxSpeed;
-    for (let i = 0; i < n; i++) {
-      let vx = (p[i * 3] - pr[i * 3]) * invDt;
-      let vy = (p[i * 3 + 1] - pr[i * 3 + 1]) * invDt;
-      let vz = (p[i * 3 + 2] - pr[i * 3 + 2]) * invDt;
-      const sp2 = vx * vx + vy * vy + vz * vz;
-      if (sp2 > maxV * maxV) {
-        const s = maxV / Math.sqrt(sp2);
-        vx *= s; vy *= s; vz *= s;
-        p[i * 3] = pr[i * 3] + vx * dt;
-        p[i * 3 + 1] = pr[i * 3 + 1] + vy * dt;
-        p[i * 3 + 2] = pr[i * 3 + 2] + vz * dt;
-      }
-      v[i * 3] = vx; v[i * 3 + 1] = vy; v[i * 3 + 2] = vz;
-    }
-    this._tVel = performance.now() - t0;
-
-    this.simMs = performance.now() - tAll0;
-
-    // diagnostics identical to base (leak detection + KE) — outside simMs
-    {
-      let ke = 0;
-      for (let i = 0; i < this.count; i++) {
-        ke += 0.5 * (v[i * 3] * v[i * 3] + v[i * 3 + 1] * v[i * 3 + 1] + v[i * 3 + 2] * v[i * 3 + 2]);
-      }
-      this.kineticEnergy = ke;
-    }
-  }
-}
 
 function median(arr) {
   const s = [...arr].sort((a, b) => a - b);
@@ -111,20 +34,17 @@ function latticeDims(target) {
 
 function profileCount(nTarget) {
   const [nx, ny, nz] = latticeDims(nTarget);
-  const sim = new ProfiledWaterSim({ h: H, maxParticles: 34000 });
+  const sim = new WaterSim({ h: H, maxParticles: 34000 });
   sim.spawnBlock(0, 0.3, 0, nx, ny, nz);
   const spawned = sim.count;
   for (let s = 0; s < WARMUP; s++) sim.step(DT, COLLIDERS);
-  const ph = { gravity: [], grid: [], pairs: [], visc: [], relax: [], collide: [], vel: [] };
+  const ph = Object.fromEntries(PHASES.map((k) => [k, []]));
   const totals = [], kes = [];
   let npairs = 0, leaked = 0;
   for (let s = 0; s < TIMED; s++) {
     sim.step(DT, COLLIDERS);
     totals.push(sim.simMs);
-    ph.gravity.push(sim._tGravity); ph.grid.push(sim._tGrid);
-    ph.pairs.push(sim._tPairs); ph.visc.push(sim._tVisc);
-    ph.relax.push(sim._tRelax); ph.collide.push(sim._tCollide);
-    ph.vel.push(sim._tVel);
+    for (const k of PHASES) ph[k].push(sim.phaseMs[k]);
     npairs = sim._npairs;
     leaked = sim.leakedTotal ?? 0;
     kes.push(sim.kineticEnergy);

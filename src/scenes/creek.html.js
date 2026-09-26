@@ -211,11 +211,11 @@ scene.add(wire);
 const bounds = { min: [-20, -3, -12], size: [40, 9, 24] };
 const pack = createWaterPack({
   scene, bounds,
-  // creek tuning (R3 research): livelier current (viscositySigma 40→8),
+  // creek tuning (R3 research): low viscosity keeps the current lively,
   // slippery riverbed + downhill assist so flow sustains on the 2% grade
   params: {
     h: 0.35, maxParticles: 26000,
-    viscositySigma: 8, viscosityBeta: 2,
+    viscositySigma: 1, viscosityBeta: 0.25,
     bedFriction: 0.05, slopeAssist: 0.8,
   },
   gui: harness.gui,
@@ -518,8 +518,17 @@ setupAutoShots(harness.renderer, 4);
 
 /* fixed-step loop: interpolate → emit → step colliders → drain → count recycle */
 let emitAcc = 0;
+// Spawns the solver has not integrated yet still sit exactly where they were
+// placed, and the overlap guard rejects new spawns on top of them. With the
+// worker sim several fixed ticks can pass per sim frame, so stack each
+// further batch of pending spawns one lattice layer higher (capped) instead
+// of losing them to the guard.
+const SPAWNS_PER_LAYER = 10, MAX_LIFT_LAYERS = 3;
+let pendingSpawns = 0, lastSimFrame = -1, syncSteps = 0;
 harness.onFixed((dt) => {
   updateInterpolatedPositions(); // BEFORE pack.step posts the next batch
+  const simFrame = pack.sim.frame ?? syncSteps;
+  if (simFrame !== lastSimFrame) { lastSimFrame = simFrame; pendingSpawns = 0; }
   if (ctrl.pour) {
     emitAcc += ctrl.rate * dt;
     while (emitAcc >= 1 && pack.sim.count < pack.sim.p.maxParticles) {
@@ -546,17 +555,22 @@ harness.onFixed((dt) => {
       const tx = 1, tz = channelDz(x);
       const len = Math.hypot(tx, tz);
       const jet = ctrl.jetSpeed; // m/s along the tangent
-      pack.sim.spawn(x, Math.max(bedY + 0.12, surfY + 0.05), z,
+      const layer = Math.min(MAX_LIFT_LAYERS, Math.floor(pendingSpawns / SPAWNS_PER_LAYER));
+      const lift = layer * pack.sim.p.h * pack.sim.p.spacingRatio;
+      pack.sim.spawn(x, Math.max(bedY + 0.12, surfY + 0.05) + lift, z,
         (tx / len) * jet, -0.02, (tz / len) * jet);
+      pendingSpawns++;
       emitAcc--;
     }
   }
   pack.step(dt, [heightCollider]);
+  syncSteps++;
   try { foam?.update?.(dt, FOAM_FLAGS); } catch (e) { /* foam is cosmetic */ }
   // outflow recycle: remove anything that reached the downstream drain
-  const before = pack.sim.count;
+  // (counted by the sim itself: with the worker sim, count deltas around a
+  // fire-and-forget drain() race with spawns landing in between)
   pack.sim.drain(drainRegion);
-  drainedTotal += before - pack.sim.count;
+  drainedTotal = pack.sim.drainedTotal ?? 0;
 });
 
 window.__dbg = { pack, harness, heights, drainRegion, channelZ, terrainH };

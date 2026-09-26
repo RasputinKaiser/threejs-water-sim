@@ -27,7 +27,9 @@ import * as THREE from 'three';
  * For each water particle i: fraction of its grid-neighborhood particles
  * that sit within 0.5h of it, over all particles within h. 1 = tight
  * cluster interior, ~0 = spray/lonely particle. Reads the solver's flat
- * spatial grid directly (cellHead/next, cellSize === h, & (D-1) masking).
+ * spatial grid directly (cellHead/next, cellSize === h, & (D-1) masking),
+ * refreshed first via sim.ensureGrid() when the sim provides it (WaterSim
+ * builds that grid lazily; step() leaves it stale).
  *
  * @param {object} sim  WaterSim-shaped object (pos, count, cellHead, next,
  *                      gridDim, cellSize/h, p.maxParticles)
@@ -35,6 +37,7 @@ import * as THREE from 'three';
  * @returns {Float32Array} cohesion per particle in [0,1]
  */
 export function computeCohesionField(sim, out = null) {
+  sim.ensureGrid?.();
   const n = sim.count;
   if (!out) out = new Float32Array(sim.p.maxParticles);
   const D = sim.gridDim;

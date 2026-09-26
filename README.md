@@ -26,17 +26,36 @@ Params: `autoshot=<sec>` · `label=<name>` · `mode=particles` (speed-colored po
 `pour=<particles/sec>` continuous pour · `autodrain=1` plughole draining.
 Then inspect the PNGs (they're real frames — preserveDrawingBuffer is on).
 
-## First project: realistic dynamic water
-PBF solver (Clavet 2005 double-density relaxation) in `src/pbf-water.js` — flat
-typed-array grid, ~9ms/step at 6k particles. Water spawns above the pool, pours
-in, splashes (white foam on low-density/high-speed particles), and settles flat
-(fill probe measures level + flatness σy). Plughole drain with auto-drain toggle.
-Colliders mirror the Box3D static pool. Surface: three.js MarchingCubes metaballs
-with RoomEnvironment reflections (transmission off — env-map is what sells it).
+## Tests & benchmarks
+```
+npm test           # solver regression tests + worker protocol test + effects smoke
+npm run fuzz       # adversarial solver fuzz suite (NaN injection, teleports, param chaos, ...)
+npm run bench      # per-phase solver profile at 8k–30k particles (sim.phaseMs)
+```
+CI (`.github/workflows/ci.yml`) runs tests, a shortened fuzz pass and the build.
+
+## Realistic dynamic water
+Clavet 2005 double-density relaxation solver in `src/water-pack/solver.js`.
+Each step sorts particles by grid cell into an internal working copy, so the
+neighbor walk reads contiguous memory; one pass builds the pair list and
+densities and applies the viscosity impulses; relaxation runs off the stored
+pairs. `pos`/`vel`/`nCount` keep their particle order for renderers.
+~40 ms/step at 26.5k particles on one core. Large scenes (creek) run it in a
+Web Worker (`workerSim: true`, needs the COOP/COEP headers the dev server sets).
+Per-step phase timings are on `sim.phaseMs`.
+
+Rendering: screen-space fluid (`src/water-pack/screen-fluid.js`: nearest-
+surface sphere splats → bilateral-smoothed depth → view-space normals →
+Fresnel/absorption composite, occluded by scene depth) or three.js
+MarchingCubes metaballs. Fill probe measures level + flatness σy; plughole
+drain with auto-drain toggle. Colliders mirror the Box3D static pool.
 
 ## Files
-- `src/main.js` — scene assembly, pool build, spawn controls, HUD
+- `src/main.js` — Pool Lab: scene assembly, Box3D pool, spawn controls, HUD
+- `src/scenes/*.html.js` — Bucket, Terrain, Big Pool and Creek labs
 - `src/debug-harness.js` — camera/lights/HUD/console-capture/screenshot/fixed-timestep loop
 - `src/box3d-debug.js` — Box3D→three sync + AABB/contact/velocity debug draws
-- `src/pbf-water.js` — PBF fluid solver
-- `src/water-render.js` — metaball surface + particle rendering + fill probe
+- `src/water-pack/` — solver, worker sim (`sim-worker.mjs` + `async-sim.js`),
+  surfaces (metaballs, screen-space), foam effects, probes, fuzz + benches
+- `src/water-render.js` — Pool Lab metaball surface + particle rendering + fill probe
+- `test/` — `node:test` suites

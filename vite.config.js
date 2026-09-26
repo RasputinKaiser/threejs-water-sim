@@ -16,7 +16,7 @@ export default defineConfig({
     strictPort: true,
     host: true,
     // Cross-origin isolation — required for SharedArrayBuffer / Web Workers
-    // with atomics (water-pack async sim path, see src/water-pack/async-sim.js).
+    // with atomics (the threaded water solver, see src/water/sim.js).
     // NOTE: any third-party script/image loaded without CORP will break under
     // require-corp; CDN assets need crossorigin/CORS.
     headers: {

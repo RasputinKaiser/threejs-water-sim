@@ -108,6 +108,7 @@ export function createDebugHarness({ container, cameraPos = [14, 11, 16], target
       ['terrain.html', '⛰ Terrain'],
       ['pool.html', '🤽 Big Pool'],
       ['creek.html', '🌊 Creek'],
+      ['water-lab.html', '💧 Water Lab'],
     ];
     nav.innerHTML = scenes.map(([file, label]) => {
       const badge = file === here && !hudHidden ? ' <span class="fps" id="nav-fps">—</span>' : '';

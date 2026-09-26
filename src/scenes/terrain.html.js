@@ -1,13 +1,15 @@
 // scenes/terrain.html.js — heightfield terrain with a crevice/channel.
-// Water pours on high ground, flows downhill, and pools in the crevice.
-// Tests: heightfield colliders + flow + multi-region census.
-// URL params: ?autoshot=N&label=x&metrics=terrain&pour=300
+// Water pours on high ground, flows downhill, and pools in the crevice basin.
+// Tests: heightfield colliders, long-distance flow, pooling.
+// URL params: ?pour ?quality=low|medium|high ?autoshot=N&label=x&metrics=terrain
 
 import * as THREE from 'three';
 import { createDebugHarness } from '../debug-harness.js';
 import { setupAutoShots } from '../debug-shot.js';
-import { createWaterPack, createFillProbe, createRegionCensus, setupMetrics } from '../water-pack/index.js';
+import { createWater } from '../water/index.js';
+import { attachWater, fillProbe, waterHudLine, addWaterGui, setupMetrics } from './water-harness.js';
 
+const qp = new URLSearchParams(location.search);
 const harness = createDebugHarness({ cameraPos: [10, 9, 12], target: [0, 1, 0] });
 const { scene } = harness;
 
@@ -58,89 +60,54 @@ const wire = new THREE.Mesh(terrainGeo, new THREE.MeshBasicMaterial({ color: 0x8
 wire.position.y = 0.01;
 scene.add(wire);
 
-/* water pack with heightfield collider */
-const bounds = { min: [-12, -3.5, -12], size: [24, 9, 24] };
-const pack = createWaterPack({
-  scene, bounds,
-  params: { h: 0.3, maxParticles: 7000 },
-  gui: harness.gui,
-  renderer: harness.renderer,
-  renderMode: 'metaballs', // default stays metaballs here; switch via GUI dropdown
+/* water with the terrain as a heightfield collider */
+const quality = qp.get('quality') ?? 'medium';
+const spacing = { low: 0.2, medium: 0.15, high: 0.12 }[quality] ?? 0.15;
+const water = await createWater({
+  renderer: harness.renderer, scene, quality,
+  render: qp.get('render') ?? 'screen',
+  params: { spacing, maxParticles: 32768, bounds: { min: [-12, -4, -12], max: [12, 7, 12] } },
 });
-pack.attachCompositor(harness);
-const heightCollider = { type: 'heightfield', minX: -SIZE / 2, minZ: -SIZE / 2, nx: NX, nz: NZ, dx: DX, dz: DX, heights };
-pack.sim.bounds = { min: [-12, -4, -12], max: [12, 6, 12] };
+water.addHeightfield({ minX: -SIZE / 2, minZ: -SIZE / 2, dx: DX, dz: DX, nx: NX, nz: NZ, heights });
 
-/* regions: crevice basin vs everywhere else */
+/* the crevice basin vs everywhere else */
 const basinCenter = [4.5, Math.sin(4.5 * 0.5) * 2.2];
-const census = createRegionCensus(pack.sim, {
-  basin: { min: [basinCenter[0] - 2.2, -3, basinCenter[1] - 2.2], max: [basinCenter[0] + 2.2, 2, basinCenter[1] + 2.2] },
-});
-const basinProbe = createFillProbe(pack.sim, {
-  min: [basinCenter[0] - 2.2, -3, basinCenter[1] - 2.2],
-  max: [basinCenter[0] + 2.2, 2, basinCenter[1] + 2.2],
-});
+const basin = { min: [basinCenter[0] - 2.2, -3, basinCenter[1] - 2.2], max: [basinCenter[0] + 2.2, 2, basinCenter[1] + 2.2] };
+const basinProbe = fillProbe(water, basin);
 
 /* pour point: high ground on the west */
-const ctrl = { pour: false, rate: 300, pourX: -8, pourZ: 1.67, clear: () => pack.sim.reset() };
-{
-  const qp = new URLSearchParams(location.search);
-  if (qp.get('pour') != null) ctrl.pour = true;
-  if (qp.get('pourX')) ctrl.pourX = parseFloat(qp.get('pourX'));
-}
+const ctrl = { pourX: parseFloat(qp.get('pourX') ?? '-8'), pourZ: 1.67 };
+const rain = water.addSource({ position: [ctrl.pourX, 4, ctrl.pourZ], direction: [0.3, -1, 0], radius: 0.35, speed: 3, enabled: qp.has('pour') });
+const move = () => { rain.position = [ctrl.pourX, 4, ctrl.pourZ]; };
 const f = harness.gui.addFolder('⛰ Terrain Flow');
-f.add(ctrl, 'pour').name('rain on/off');
-f.add(ctrl, 'rate', 50, 800, 10).name('rate /s');
-f.add(ctrl, 'pourX', -10, 0, 0.5).name('pour x');
-f.add(ctrl, 'pourZ', -8, 8, 0.5).name('pour z');
-const renderModeCtrl = { renderMode: 'metaballs' };
-f.add(renderModeCtrl, 'renderMode', ['auto', 'metaballs', 'screen'])
-  .name('render mode')
-  .onChange((m) => Promise.resolve(pack.setRenderMode(m)).catch(
-    (e) => window.pushDbg?.(`[terrain] setRenderMode('${m}') failed: ${e?.message ?? e}`)));
-f.add(ctrl, 'clear').name('clear');
-f.close();
+f.add(rain, 'enabled').name('pour on/off');
+f.add(rain, 'speed', 0.5, 8, 0.1).name('pour speed (m/s)');
+f.add(ctrl, 'pourX', -10, 0, 0.5).name('pour x').onChange(move);
+f.add(ctrl, 'pourZ', -8, 8, 0.5).name('pour z').onChange(move);
+f.add({ dump: () => water.fillBox([ctrl.pourX - 0.8, 2, ctrl.pourZ - 0.8], [ctrl.pourX + 0.8, 3.2, ctrl.pourZ + 0.8]) }, 'dump').name('💧 dump a block');
+f.add({ clear: () => water.reset() }, 'clear').name('clear');
+addWaterGui(harness.gui, water);
 
 /* HUD + metrics */
-let probeData = { count: 0, meanY: NaN, stdY: NaN, fillPct: 0 };
-let censusData = { basin: 0, _other: 0 };
+let probeData = basinProbe.measure();
 let hudTick = 0;
+const num = (v, d = 3) => (Number.isFinite(v) ? v.toFixed(d) : '—');
 harness.setHudProvider(() => [
-  `<b>Terrain Lab</b> — crevice channel, h=0.3`,
-  `fps <b>${harness.fps.toFixed(0)}</b>  sim ${pack.sim.simMs.toFixed(1)}ms  particles <b>${pack.sim.count}</b>`,
-  `basin: <b>${censusData.basin}</b> pts  elsewhere <b>${censusData._other}</b>`,
-  `basin level <b>${Number.isFinite(probeData.meanY) ? probeData.meanY.toFixed(3) : '—'}</b>m  σy <b>${Number.isFinite(probeData.stdY) ? probeData.stdY.toFixed(3) : '—'}</b>`,
-  `leaked: <b>${pack.sim.leakedTotal ?? 0}</b>  KE: ${(pack.sim.kineticEnergy ?? 0).toFixed(0)}`,
-  `render <b>${pack.screenState.active ? 'screen' : 'metaballs'}</b>` +
-    (pack.screenState.error ? ` <span class="warn">(${pack.screenState.error})</span>` : ''),
+  `<b>Terrain Lab</b> — crevice channel, spacing ${water.params.spacing} m`,
+  waterHudLine(harness, water),
+  `basin: <b>${probeData.count}</b> particles  elsewhere <b>${water.count - probeData.count}</b>`,
+  `basin level <b>${num(probeData.level, 2)}</b> m  surface σ <b>${num(probeData.flatness)}</b> m`,
+  `leaked: <b>${water.stats.leaked ?? 0}</b>  KE ${num(water.stats.kineticEnergy, 0)} J`,
 ]);
-
 setupMetrics(() => ({
-  scene: 'terrain', particles: pack.sim.count, simMs: +pack.sim.simMs.toFixed(2),
-  basin: probeData, census: censusData, leaked: pack.sim.leakedTotal ?? 0,
-  kineticEnergy: +(pack.sim.kineticEnergy ?? 0).toFixed(1),
+  scene: 'terrain', particles: water.count, stepMs: water.stats.stepMs, basin: probeData,
+  leaked: water.stats.leaked ?? 0, kineticEnergy: water.stats.kineticEnergy,
 }));
-
 setupAutoShots(harness.renderer, 4);
 
-let emitAcc = 0;
-harness.onFixed((dt) => {
-  if (ctrl.pour) {
-    emitAcc += ctrl.rate * dt;
-    while (emitAcc >= 1 && pack.sim.count < pack.sim.p.maxParticles) {
-      pack.sim.spawn(ctrl.pourX + (Math.random() - 0.5) * 0.5, 4 + Math.random() * 0.5,
-        ctrl.pourZ + (Math.random() - 0.5) * 0.5, 0.5, -1, (Math.random() - 0.5) * 0.5);
-      emitAcc--;
-    }
-  }
-  pack.step(dt, [heightCollider]);
-  if (++hudTick % 10 === 0) {
-    probeData = basinProbe.measure();
-    censusData = census.measure();
-  }
-});
+attachWater(harness, water, { after() { if (++hudTick % 15 === 0) probeData = basinProbe.measure(); } });
 
-window.__dbg = { pack, probe: basinProbe, census, harness, heights };
+window.__dbg = { water, probe: basinProbe, harness, heights };
 window.pushDbg?.('Terrain Lab ready');
-harness.tidyGui(); // all param subfolders collapsed by default
+harness.tidyGui();
 harness.start();

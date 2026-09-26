@@ -24,6 +24,9 @@ export const A = {
   LEAKED: 7,
   QUARANTINED: 8,
   OVERFLOW: 9,
+  DIFF_COUNT: 10,  // whitewater particles
+  DIFF_NEXT: 11,   // survivors appended during advection
+  FRAME: 12,
   IMPULSES: 16,    // then nCol × 6 fixed-point impulses, then nCol × 4 contacts
 };
 export const IMPULSE_SCALE = 1e4;   // N·s → i32
@@ -42,7 +45,12 @@ struct Params {
   bmaxX: f32, bmaxY: f32, bmaxZ: f32, touch: f32,
   nCol: u32, mask: u32, M: u32, upper: u32,
   hfBase: u32, tabBase: u32, tabN: u32, nDrains: u32,
-  frames: f32, nScan: u32, nBlocks: u32, pad1: u32,
+  frames: f32, nScan: u32, nBlocks: u32, D: u32,
+  wwTa: f32, wwWc: f32, taLo: f32, taHi: f32,
+  wcLo: f32, wcHi: f32, ekLo: f32, ekHi: f32,
+  lifeLo: f32, lifeHi: f32, wwBuoy: f32, wwDrag: f32,
+  wwAir: f32, sprayMax: f32, bubbleMin: f32, invSurf: f32,
+  stepDt: f32, pad0: f32, pad1: f32, pad2: f32,
   drains: array<vec4f, 16>,   // min.xyz / max.xyz pairs (8 boxes)
 };
 
@@ -63,6 +71,8 @@ struct Params {
 @group(0) @binding(14) var<storage, read_write> atoms: array<atomic<i32>>;
 @group(0) @binding(15) var<storage, read_write> dv: array<vec4f>;    // per particle: Δv, ω
 @group(0) @binding(16) var<storage, read> spawnBuf: array<vec4f>;
+@group(0) @binding(17) var<storage, read_write> diffA: array<vec4f>;  // (pos, life), (vel, type)
+@group(0) @binding(18) var<storage, read_write> diffB: array<vec4f>;
 
 const EMPTY: u32 = 0xffffffffu;
 
@@ -551,14 +561,33 @@ fn residual(i: u32, density: bool, accumulate: bool) {
   let base = i * (P.M + 1u);
   let nn = nbr[base];
   var ax = vec3f(0.0); var w = vec3f(0.0);
+  var ta = 0.0; var cg = vec3f(0.0);
+  // whitewater potentials only above the kinetic-energy ramp (rate 0 below)
+  let ww = P.D > 0u && 0.5 * dot(vi, vi) > P.ekLo;
   for (var t = 0u; t < nn; t++) {
     let j = nbr[base + 1u + t];
     let pj = pos[j];
     let d = xi - pj.xyz;
     let invRho = 1.0 / aux[j].x;
     let u = vel[j].xyz - vi;
-    ax += u * (kernW(length(d) * P.invH) * invRho);
-    w += cross(u, gradW(d, pi.w, pj.w) * invRho);
+    let r = length(d);
+    ax += u * (kernW(r * P.invH) * invRho);
+    let gq = gradW(d, pi.w, pj.w) * invRho;
+    w += cross(u, gq);
+    // whitewater: colour-field gradient and trapped air (neighbors converging)
+    if (ww) {
+      cg += gq;
+      let vr = length(u);
+      if (r > 1e-9 && vr > 1e-6) { ta += vr * (1.0 + dot(u, d) / (vr * r)) * (1.0 - r * P.invH); }
+    }
+  }
+  var gen = 0.0;
+  if (ww) {
+    let cl = length(cg);
+    var crest = 0.0;
+    if (cl > 1e-9) { let o = -dot(vi, cg) / cl; if (o > 0.0) { crest = min(1.0, cl * P.invSurf) * o; } }
+    let ek = ramp(0.5 * dot(vi, vi), P.ekLo, P.ekHi);
+    gen = ek * (P.wwTa * ramp(ta, P.taLo, P.taHi) + P.wwWc * ramp(crest, P.wcLo, P.wcHi));
   }
   let xsph = 1.0 - pow(1.0 - min(P.visc, 0.99), P.frames);
   var dvi = vec3f(P.gx, P.gy, P.gz) * P.dt + xsph * ax;
@@ -583,8 +612,109 @@ fn residual(i: u32, density: bool, accumulate: bool) {
       if (cDynamic(c)) { addImpulse(c, xi, -P.pmass * f); }
     }
   }
-  dv[i * 2u] = vec4f(dvi, 0.0);
+  dv[i * 2u] = vec4f(dvi, gen);
   dv[i * 2u + 1u] = vec4f(w, length(w));
+}
+fn ramp(x: f32, lo: f32, hi: f32) -> f32 { return clamp((x - lo) / (hi - lo), 0.0, 1.0); }
+
+// ------------------------------------------------------------ whitewater
+fn rnd(seed: u32) -> f32 {
+  var x = seed * 747796405u + 2891336453u;
+  x = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
+  x = (x >> 22u) ^ x;
+  return f32(x) / 4294967296.0;
+}
+// once per step: emit diffuse particles from each fluid particle's rate
+// (the last substep's potentials), stochastic rounding as on the CPU
+@compute @workgroup_size(64) fn wwEmit(@builtin(global_invocation_id) g: vec3u) {
+  let i = g.x;
+  if (i >= count()) { return; }
+  let rate = dv[i * 2u].w;
+  if (!(rate > 0.0)) { return; }
+  let p = pos[i]; let v = vel[i].xyz;
+  let seed = bitcast<u32>(p.w) * 9781u + u32(atomicLoad(&atoms[${A.FRAME}])) * 6271u;
+  let n = u32(floor(rate * P.stepDt + rnd(seed)));
+  if (n == 0u) { return; }
+  let sp = length(v);
+  var a = vec3f(0.0, 1.0, 0.0);
+  if (sp > 1e-6) { a = v / sp; }
+  let e1 = normalize(select(vec3f(-a.y, a.x, 0.0), vec3f(0.0, -a.z, a.y), abs(a.z) > 0.9));
+  let e2 = cross(a, e1);
+  for (var k = 0u; k < n; k++) {
+    let slot = u32(atomicAdd(&atoms[${A.DIFF_COUNT}], 1));
+    if (slot >= P.D) { atomicSub(&atoms[${A.DIFF_COUNT}], 1); return; }
+    let s = seed + (k + 1u) * 8u;
+    let r = 0.5 * P.spacing * sqrt(rnd(s));
+    let th = rnd(s + 1u) * 6.2831853;
+    let hv = rnd(s + 2u) * sp * P.stepDt;
+    let off = cos(th) * r * e1 + sin(th) * r * e2;
+    diffA[slot * 2u] = vec4f(p.xyz + off + hv * a, mix(P.lifeLo, P.lifeHi, rnd(s + 3u)));
+    diffA[slot * 2u + 1u] = vec4f(v + 2.0 * off, 0.0);
+  }
+}
+// classify by fluid neighbors, advect, age; survivors appended to diffB
+@compute @workgroup_size(64) fn wwAdvect(@builtin(global_invocation_id) g: vec3u) {
+  let k = g.x;
+  let m = min(u32(atomicLoad(&atoms[${A.DIFF_COUNT}])), P.D);
+  if (k >= m) { return; }
+  let pl = diffA[k * 2u];
+  var x = pl.xyz; var v = diffA[k * 2u + 1u].xyz; var life = pl.w;
+  if (life <= 0.0) { return; }
+  let c = cellOf(x);
+  let h2 = P.h * P.h;
+  var cnt = 0.0; var ws = 0.0; var fv = vec3f(0.0);
+  var bk: array<u32, 27>;
+  var nb = 0u;
+  for (var dz = -1; dz <= 1; dz++) { for (var dy = -1; dy <= 1; dy++) { for (var dx = -1; dx <= 1; dx++) {
+    let b = hashCell(c + vec3i(dx, dy, dz)) & P.mask;
+    var dup = false;
+    for (var q = 0u; q < nb; q++) { if (bk[q] == b) { dup = true; break; } }
+    if (!dup) { bk[nb] = b; nb++; }
+  } } }
+  for (var q = 0u; q < nb; q++) {
+    let b = bk[q];
+    let e = atomicLoad(&cells[b + 1u]);
+    for (var j = atomicLoad(&cells[b]); j < e; j++) {
+      let d = x - pos[j].xyz;
+      let r2 = dot(d, d);
+      if (r2 >= h2) { continue; }
+      cnt += 1.0;
+      let wk = kernW(sqrt(r2) * P.invH);
+      ws += wk; fv += wk * vel[j].xyz;
+    }
+  }
+  if (ws > 0.0) { fv /= ws; }
+  let grav = vec3f(P.gx, P.gy, P.gz);
+  let bdt = P.stepDt;
+  var kind = 1.0;
+  if (cnt < P.sprayMax) {
+    kind = 0.0;
+    v = (v + grav * bdt) * exp(-P.wwAir * bdt);
+    life -= 0.25 * bdt;
+  } else if (cnt > P.bubbleMin) {
+    kind = 2.0;
+    v += -P.wwBuoy * grav * bdt + P.wwDrag * (fv - v);
+    life -= 0.25 * bdt;
+  } else {
+    v = fv;
+    life -= bdt;
+  }
+  x += v * bdt;
+  if (P.boundsOn > 0.5 && (x.x < P.bminX || x.y < P.bminY || x.z < P.bminZ || x.x > P.bmaxX || x.y > P.bmaxY || x.z > P.bmaxZ)) { life = 0.0; }
+  if (kind < 0.5 && life > 0.0) {   // spray only: foam moves with the fluid
+    for (var ci = 0u; ci < P.nCol; ci++) {
+      if (cNear(ci, x, 0.0) && sdf(ci, x).d < 0.0) { life = 0.0; break; }
+    }
+  }
+  if (life <= 0.0) { return; }
+  let o = u32(atomicAdd(&atoms[${A.DIFF_NEXT}], 1));
+  diffB[o * 2u] = vec4f(x, life);
+  diffB[o * 2u + 1u] = vec4f(v, kind);
+}
+@compute @workgroup_size(1) fn wwCommit() {
+  atomicStore(&atoms[${A.DIFF_COUNT}], atomicLoad(&atoms[${A.DIFF_NEXT}]));
+  atomicStore(&atoms[${A.DIFF_NEXT}], 0);
+  atomicAdd(&atoms[${A.FRAME}], 1);
 }
 @compute @workgroup_size(64) fn confine(@builtin(global_invocation_id) g: vec3u) {
   let i = g.x;

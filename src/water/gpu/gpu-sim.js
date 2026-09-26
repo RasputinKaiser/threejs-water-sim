@@ -39,9 +39,13 @@ const BINDINGS = {
   forces: [0, 1, 2, 10, 11, 12, 13, 14, 15],
   confine: [0, 1, 2, 10, 11, 14, 15],
   integrate: [0, 1, 2, 13, 14],
+  wwEmit: [0, 1, 2, 14, 15, 17],
+  wwAdvect: [0, 1, 2, 8, 13, 14, 17, 18],
+  wwCommit: [14],
 };
 
-const PARAM_FLOATS = 40 + 16 * 4;
+const DRAIN_OFFSET = 60;
+const PARAM_FLOATS = DRAIN_OFFSET + 16 * 4;
 const MAX_DRAINS = 8;
 const HF_CAPACITY = 1 << 20;   // floats reserved for heightfields
 const MAX_HEIGHTFIELDS = 16;
@@ -77,6 +81,7 @@ export async function createGPUSimulation(dp, opts = {}) {
   const adaptive = opts.gpuIterations == null;
   const divergenceIterations = opts.gpuDivergenceIterations ?? 1;
   const readVelocities = opts.readVelocities ?? true;
+  const D = dp.maxDiffuse | 0;                   // whitewater capacity (0: off)
 
   /* ------------------------------ buffers ------------------------------ */
   const S = GPUBufferUsage.STORAGE, CD = GPUBufferUsage.COPY_DST, CS = GPUBufferUsage.COPY_SRC;
@@ -94,9 +99,13 @@ export async function createGPUSimulation(dp, opts = {}) {
     nbr: mk(N * (M + 1) * 4, S), aux: mk(N * 16, S), bnd: mk(N * K_BND * 32, S),
     world: mk(worldFloats * 4, S | CD), atoms: mk(nAtoms * 4, S | CD | CS),
     dv: mk(N * 32, S), spawn: mk((1 + 2 * N) * 16, S | CD),
+    // whitewater: (pos, life), (vel, type) per particle; survivors of each
+    // step are compacted into diffB and copied back
+    diffA: mk(D * 32, S | CD | CS), diffB: mk(D * 32, S | CS),
   };
   const byBinding = [buf.params, buf.pos, buf.vel, buf.prv, buf.posB, buf.velB, buf.prvB, buf.keys,
-    buf.cells, buf.blocks, buf.nbr, buf.aux, buf.bnd, buf.world, buf.atoms, buf.dv, buf.spawn];
+    buf.cells, buf.blocks, buf.nbr, buf.aux, buf.bnd, buf.world, buf.atoms, buf.dv, buf.spawn,
+    buf.diffA, buf.diffB];
 
   // world: colliders | heightfield offsets | heightfields | Ψ table | Ψ' table
   const world = new Float32Array(worldFloats);
@@ -124,7 +133,7 @@ export async function createGPUSimulation(dp, opts = {}) {
   const pf = new Float32Array(PARAM_FLOATS), pu = new Uint32Array(pf.buffer);
   let colliderCount = 0;
   const drains = [];      // persistent {min,max} boxes set via removeInBox (one batch)
-  function writeParams(dt, frames) {
+  function writeParams(dt, frames, stepDt) {
     const g = dp.gravity, b = dp.bounds;
     pf.set([dt, g[0], g[1], g[2], dp.h, 1 / dp.h, dp.kernelSigma, dp.rho0,
       dp.spacing, dp.viscosity, dp.vorticity, dp.friction,
@@ -133,20 +142,27 @@ export async function createGPUSimulation(dp, opts = {}) {
       b ? b.min[0] : 0, b ? b.min[1] : 0, b ? b.min[2] : 0, b ? 1 : 0,
       b ? b.max[0] : 0, b ? b.max[1] : 0, b ? b.max[2] : 0, dp.particleRadius + 0.25 * dp.spacing], 0);
     pu.set([colliderCount, T - 1, M, N, hfBase, tabBase, tabN, Math.min(drains.length, MAX_DRAINS)], 28);
-    pf[36] = frames; pu[37] = nScan; pu[38] = nBlocks; pu[39] = 0;
+    pf[36] = frames; pu[37] = nScan; pu[38] = nBlocks; pu[39] = D;
+    pf.set([dp.wwTrappedAir, dp.wwWaveCrest, ...dp.wwTrappedAirRange,
+      ...dp.wwCrestRange, ...dp.wwEnergy,
+      ...dp.wwLifetime, dp.wwBuoyancy, dp.wwDrag,
+      dp.wwAirDrag, dp.wwSprayNeighbors, dp.wwBubbleNeighbors, 1 / dp.wwSurfaceGrad,
+      stepDt, 0, 0, 0], 40);
     for (let k = 0; k < MAX_DRAINS; k++) {
       const d = drains[k];
-      pf.set(d ? [...d.min, 0, ...d.max, 0] : [0, 0, 0, 0, 0, 0, 0, 0], 40 + k * 8);
+      pf.set(d ? [...d.min, 0, ...d.max, 0] : [0, 0, 0, 0, 0, 0, 0, 0], DRAIN_OFFSET + k * 8);
     }
     device.queue.writeBuffer(buf.params, 0, pf);
   }
 
   /* ------------------------------ readback ----------------------------- */
   const readBytes = N * 16;
-  const staging = device.createBuffer({ size: readBytes * 3 + nAtoms * 4, usage: GPUBufferUsage.MAP_READ | CD });
+  const diffOffset = readBytes * 3 + nAtoms * 4;
+  const staging = device.createBuffer({ size: diffOffset + D * 32, usage: GPUBufferUsage.MAP_READ | CD });
   const out = {
     pos: new Float32Array(N * 3), prev: new Float32Array(N * 3), vel: new Float32Array(N * 3),
     ids: new Int32Array(N), nbr: new Int32Array(N),
+    diffuse: new Float32Array(D * 4), diffuseCount: 0,
   };
   let count = 0, lastStats = {}, lastMs = 0, vmax = 0;
   const impulseAcc = new Float64Array(C * 6);
@@ -207,6 +223,16 @@ export async function createGPUSimulation(dp, opts = {}) {
     p.end();
   }
 
+  // whitewater once per step (as the CPU solver does), on the final grid
+  function encodeWhitewater(enc) {
+    const p = enc.beginComputePass();
+    dispatch(p, 'wwEmit', wg(N));
+    dispatch(p, 'wwAdvect', wg(D));
+    dispatch(p, 'wwCommit', 1);
+    p.end();
+    enc.copyBufferToBuffer(buf.diffB, 0, buf.diffA, 0, D * 32);
+  }
+
   function postSteps(k) {
     busy = true;
     const t0 = performance.now();
@@ -215,7 +241,7 @@ export async function createGPUSimulation(dp, opts = {}) {
     const sub = Math.min(Math.max(1, dp.maxSubsteps | 0), Math.max(dp.minSubsteps ?? 1,
       Math.ceil(base.fixedDt * (vmax + g * base.fixedDt) / (dp.cfl * dp.spacing))));
     const dt = base.fixedDt / sub;
-    writeParams(dt, dt * 60);
+    writeParams(dt, dt * 60, base.fixedDt);
     const enc = device.createCommandEncoder();
     // per-batch accumulators
     enc.clearBuffer(buf.atoms, A.ERR_SUM * 4, (A.VMAX - A.ERR_SUM + 1) * 4);
@@ -240,11 +266,13 @@ export async function createGPUSimulation(dp, opts = {}) {
     }
     for (let s = 0; s < k; s++) {
       for (let u = 0; u < sub; u++) encodeSubstep(enc, { last: s === k - 1 && u === 0, final: s === k - 1 && u === sub - 1 });
+      if (D > 0) encodeWhitewater(enc);
     }
     enc.copyBufferToBuffer(buf.pos, 0, staging, 0, readBytes);
     enc.copyBufferToBuffer(buf.prv, 0, staging, readBytes, readBytes);
     if (readVelocities) enc.copyBufferToBuffer(buf.vel, 0, staging, 2 * readBytes, readBytes);
     enc.copyBufferToBuffer(buf.atoms, 0, staging, 3 * readBytes, nAtoms * 4);
+    if (D > 0) enc.copyBufferToBuffer(buf.diffA, 0, staging, diffOffset, D * 32);
     device.queue.submit([enc.finish()]);
     drains.length = 0;
     staging.mapAsync(GPUMapMode.READ).then(() => {
@@ -264,6 +292,16 @@ export async function createGPUSimulation(dp, opts = {}) {
           out.vel[i * 3] = V4[i * 4]; out.vel[i * 3 + 1] = V4[i * 4 + 1]; out.vel[i * 3 + 2] = V4[i * 4 + 2];
         }
       }
+      // whitewater → [x, y, z, type + alpha] (alpha fades over the last second)
+      const m = D > 0 ? Math.max(0, Math.min(D, at[A.DIFF_COUNT])) : 0;
+      if (m > 0) {
+        const W = new Float32Array(raw, diffOffset, m * 8), o = out.diffuse;
+        for (let q = 0; q < m; q++) {
+          o[q * 4] = W[q * 8]; o[q * 4 + 1] = W[q * 8 + 1]; o[q * 4 + 2] = W[q * 8 + 2];
+          o[q * 4 + 3] = W[q * 8 + 7] + 0.999 * Math.min(1, Math.max(0, W[q * 8 + 3]));
+        }
+      }
+      out.diffuseCount = m;
       const f = new Float32Array(1), fi = new Int32Array(f.buffer);
       fi[0] = at[A.ERR_MAX]; const errMax = f[0];
       fi[0] = at[A.VMAX]; vmax = f[0];
@@ -285,7 +323,7 @@ export async function createGPUSimulation(dp, opts = {}) {
         kineticEnergy: NaN, maxDensityError: errMax,
         avgDensityError: count ? at[A.ERR_SUM] / 1e5 / count : 0,
         pressureIterations, divergenceIterations, substeps: sub, maxSpeed: vmax,
-        overflow: at[A.OVERFLOW], leaked, quarantined, drained,
+        overflow: at[A.OVERFLOW], leaked, quarantined, drained, whitewater: m,
       };
       if (adaptive && count > 0) {
         const tol = dp.densityTolerance, e = lastStats.avgDensityError;
@@ -326,7 +364,7 @@ export async function createGPUSimulation(dp, opts = {}) {
     get alpha() { return base.alpha; },
     get stepMs() { return lastMs; },
     get stats() { return lastStats; },
-    get diffuse() { return { count: 0, data: new Float32Array(0) }; },
+    get diffuse() { return { count: out.diffuseCount, data: out.diffuse }; },
     get busy() { return busy; },
     takeImpulses() {
       const t = impulseTime; impulseTime = 0;
@@ -343,7 +381,8 @@ export async function createGPUSimulation(dp, opts = {}) {
     reset() {
       pendingSpawn = [];
       device.queue.writeBuffer(buf.atoms, A.COUNT * 4, new Int32Array([0]));
-      count = 0;
+      device.queue.writeBuffer(buf.atoms, A.DIFF_COUNT * 4, new Int32Array([0, 0]));
+      count = 0; out.diffuseCount = 0;
     },
     setColliders(list) { flushColliders(list); },
     addHeightfield(desc) {

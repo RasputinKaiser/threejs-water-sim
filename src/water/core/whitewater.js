@@ -19,8 +19,8 @@
 //   spray   n < ¼ full  ballistic under gravity with light air drag
 //   foam    otherwise   carried by the local fluid velocity; ages and dies
 //   bubble  n > ¾ full  buoyant, dragged toward the fluid velocity
-// Diffuse particles never act on the fluid. Spray/foam that ends up inside a
-// solid or out of bounds dies; spray and bubbles age slowly so nothing lives
+// Diffuse particles never act on the fluid. Spray that flies into a solid and
+// anything out of bounds dies; spray and bubbles age slowly so nothing lives
 // forever.
 
 import { colliderNear, colliderSDF } from './colliders.js';
@@ -155,7 +155,9 @@ export function advectWhitewater(solver, i0, i1, dt) {
     }
     x += vx * dt; y += vy * dt; z += vz * dt;
     if (bOn && (x < x0 || x > x1 || y < y0 || y > y1 || z < z0 || z > z1)) life = 0;
-    else if (type !== 2) {
+    else if (type === 0) {
+      // only ballistic spray can fly into a solid (foam moves with the fluid,
+      // which the boundaries already keep out; bubbles are under water)
       for (let c = 0; c < nc; c++) {
         if (!colliderNear(rec, c, x, y, z, 0)) continue;
         if (colliderSDF(rec, c, hf, x, y, z, n) < 0) { life = 0; break; }

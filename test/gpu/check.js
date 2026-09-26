@@ -7,7 +7,8 @@ const params = new URLSearchParams(location.search);
 const scenarios = (params.get('s') ?? 'column,dam').split(',');
 
 async function run(backend, scenario) {
-  const sim = await createSimulation({ solver: 'dfsph', spacing: 0.1, maxParticles: 16384, maxDiffuse: 0 },
+  const ww = scenario === 'plunge';
+  const sim = await createSimulation({ solver: 'dfsph', spacing: 0.1, maxParticles: 16384, maxDiffuse: ww ? 16384 : 0 },
     { backend, threads: 0, maxStepsPerFrame: 1 });
   let frames = 120;
   if (scenario === 'column') {
@@ -22,11 +23,27 @@ async function run(backend, scenario) {
       { type: 'sphere', position: [0, 0.6, 0], radius: 0.25, dynamic: true, slot: 1, mass: 1e9 }]);
     sim.fillBox([-0.75, 0, -0.75], [0.75, 1.2, 0.75], { jitter: 0 });
     frames = 150;
+  } else if (scenario === 'plunge') {
+    // the whitewater test (test/whitewater.test.mjs): a block dropped into a pool
+    sim.setColliders([{ type: 'container', position: [0, 1, 0], size: [0.8, 1, 0.8] }]);
+    sim.fillBox([-0.8, 0, -0.8], [0.8, 0.5, 0.8], { jitter: 0 });
+    frames = 120;
   }
+  const peak = [0, 0, 0];
+  let still = 0;
   const t0 = performance.now();
   for (let f = 0; f < frames; f++) {
     if (f === 90 && scenario === 'buoy') sim.takeImpulses();
+    if (ww && f === 30) {
+      still = sim.diffuse.count;
+      sim.fillBox([-0.3, 1.2, -0.3], [0.3, 1.8, 0.3], { velocity: [0, -3, 0] });
+    }
     if (sim.mode === 'gpu') await sim.stepNow(1); else sim.stepNow(1);
+    if (ww) {
+      const { count, data } = sim.diffuse, t = [0, 0, 0];
+      for (let k = 0; k < count; k++) t[Math.floor(data[k * 4 + 3])]++;
+      for (let q = 0; q < 3; q++) peak[q] = Math.max(peak[q], t[q]);
+    }
   }
   const ms = (performance.now() - t0) / frames;
   const n = sim.count, p = sim.positions, v = sim.velocities;
@@ -37,6 +54,7 @@ async function run(backend, scenario) {
     const { impulses, time } = sim.takeImpulses();
     out.buoyancy = impulses[1 * 6 + 1] / time / (1000 * 9.81 * (4 / 3) * Math.PI * 0.25 ** 3);
   }
+  if (ww) { out.still = still; out.peak = peak; out.final = sim.diffuse.count; }
   sim.dispose?.();
   return out;
 }
@@ -48,7 +66,7 @@ try {
       const r = await run(backend, s);
       result[`${s}/${backend}`] = r;
       log(`${s.padEnd(7)} ${r.backend.padEnd(7)} n=${r.n} mean y ${r.mean.toFixed(3)} top ${r.top.toFixed(3)} xmax ${r.xmax.toFixed(2)} rms ${r.rms.toFixed(3)} ` +
-        `ρ err max ${((r.err ?? 0) * 100).toFixed(2)}% avg ${((r.avg ?? 0) * 100).toFixed(3)}% it ${r.it} leaked ${r.leaked} ${r.buoyancy != null ? `buoyancy ${r.buoyancy.toFixed(3)}×ρgV ` : ''}${r.ms.toFixed(1)} ms/frame`);
+        `ρ err max ${((r.err ?? 0) * 100).toFixed(2)}% avg ${((r.avg ?? 0) * 100).toFixed(3)}% it ${r.it} leaked ${r.leaked} ${r.buoyancy != null ? `buoyancy ${r.buoyancy.toFixed(3)}×ρgV ` : ''}${r.peak ? `whitewater still ${r.still} peak spray/foam/bubble ${r.peak.join('/')} final ${r.final} ` : ''}${r.ms.toFixed(1)} ms/frame`);
     }
   }
 } catch (e) { log('ERROR ' + (e.stack ?? e)); result.error = String(e.stack ?? e); }

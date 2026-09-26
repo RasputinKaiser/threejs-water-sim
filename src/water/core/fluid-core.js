@@ -319,6 +319,10 @@ export class FluidCore {
     const stamp = this._stamp, buckets = this._buckets;
     let cIdx = this._candIdx, cPos = this._candPos;
     let overflow = 0;
+    // DFSPH: the per-pair kernel cache [∇W xyz, W] is filled here, while the
+    // pair's offset is at hand (the density pass then only streams it)
+    const pair = this.pair ?? null, id = this.id;
+    const sig = this.p.kernelSigma, sigH = sig * inv, gMax = sigH * 2;
     let i = i0;
     while (i < i1) {
       const i3 = i * 3;
@@ -371,8 +375,28 @@ export class FluidCore {
           if (r2 < h2) {
             const j = cIdx[c];
             if (j === a) continue;
-            if (k < M) nbr[base + k++] = j;
-            else overflow++;
+            if (k >= M) { overflow++; continue; }
+            const t = base + k++;
+            nbr[t] = j;
+            if (pair === null) continue;
+            const r = Math.sqrt(r2), q = r * inv, t4 = t * 4;
+            let W, g;
+            if (q <= 0.5) { W = sig * (6 * q * q * q - 6 * q * q + 1); g = sigH * (18 * q * q - 12 * q); }
+            else { const b = 1 - q; W = 2 * sig * b * b * b; g = -6 * sigH * b * b; }
+            if (r > 1e-6 * h) {
+              g /= r;
+              pair[t4] = g * dx; pair[t4 + 1] = g * dy; pair[t4 + 2] = g * dz;
+            } else {
+              // coincident pair (water spawned on water): a deterministic,
+              // antisymmetric separation direction from the two ids at the
+              // kernel's steepest gradient — otherwise both stay coincident
+              const ia = id[a], ib = id[j], lo = ia < ib ? ia : ib, hi = ia < ib ? ib : ia;
+              const hsh = Math.imul(lo, 73856093) ^ Math.imul(hi, 19349663);
+              const th = (hsh & 1023) * (Math.PI * 2 / 1024), ph = ((hsh >>> 10) & 1023) * (Math.PI / 1024);
+              const sg = ia < ib ? gMax : -gMax;
+              pair[t4] = sg * Math.sin(ph) * Math.cos(th); pair[t4 + 1] = sg * Math.cos(ph); pair[t4 + 2] = sg * Math.sin(ph) * Math.sin(th);
+            }
+            pair[t4 + 3] = W;
           }
         }
         cnt[a] = k;

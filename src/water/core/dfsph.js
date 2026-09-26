@@ -109,44 +109,22 @@ export class DFSPHSolver extends FluidCore {
   phaseDensity(i0, i1) {
     const dp = this.p;
     const p = this.pos, v = this.vel, nbr = this.nbr, cnt = this.nbrCount, M = this.M;
-    const h = dp.h, invH = 1 / h, sig = dp.kernelSigma, sigH = sig * invH;
-    const rho0 = dp.rho0, W0 = dp.W0;
+    const h = dp.h, rho0 = dp.rho0, W0 = dp.W0;
     const pair = this.pair, bnd = this.bnd, dens = this.density, beta = this.beta;
     const rec = this.colliders, hf = this.heightfields, cand = this.cand, n = this._n, cv = this._cv;
-    const Ft = this.bndF, dFt = this.bndDF, tInv = dp.bndInv, gv = this._g, id = this.id;
+    const Ft = this.bndF, dFt = this.bndDF, tInv = dp.bndInv, gv = this._g;
     const kap = this.kappa, minN = dp.minNeighbors;
-    const gMax = sigH * 2; // |dW/dr| at q = ⅓, the cubic kernel's steepest point
     for (let i = i0; i < i1; i++) {
       const i3 = i * 3;
       const xi = p[i3], yi = p[i3 + 1], zi = p[i3 + 2];
       let rho = W0, gx = 0, gy = 0, gz = 0, sum2 = 0, drho = 0;
       const vxi = v[i3], vyi = v[i3 + 1], vzi = v[i3 + 2];
       const base = i * M, e = base + cnt[i];
+      // the pair cache [∇W, W] was filled by the neighbor search
       for (let t = base; t < e; t++) {
-        const j3 = nbr[t] * 3;
-        const dx = xi - p[j3], dy = yi - p[j3 + 1], dz = zi - p[j3 + 2];
-        const r = Math.sqrt(dx * dx + dy * dy + dz * dz), q = r * invH;
-        let W, dW;
-        if (q <= 0.5) { W = sig * (6 * q * q * q - 6 * q * q + 1); dW = sigH * (18 * q * q - 12 * q); }
-        else if (q < 1) { const a = 1 - q; W = 2 * sig * a * a * a; dW = -6 * sigH * a * a; }
-        else { W = 0; dW = 0; }
-        let ax, ay, az;
-        if (r > 1e-6 * h) {
-          const g = dW / r;
-          ax = g * dx; ay = g * dy; az = g * dz;
-        } else {
-          // coincident pair (water spawned on water): a deterministic,
-          // antisymmetric separation direction from the two ids at the
-          // kernel's steepest gradient — otherwise both stay coincident forever
-          const a = id[i], b = id[nbr[t]], lo = a < b ? a : b, hi = a < b ? b : a;
-          const hsh = Math.imul(lo, 73856093) ^ Math.imul(hi, 19349663);
-          const th = (hsh & 1023) * (Math.PI * 2 / 1024), ph = ((hsh >>> 10) & 1023) * (Math.PI / 1024);
-          const sg = a < b ? gMax : -gMax;
-          ax = sg * Math.sin(ph) * Math.cos(th); ay = sg * Math.cos(ph); az = sg * Math.sin(ph) * Math.sin(th);
-        }
-        const t4 = t * 4;
-        pair[t4] = ax; pair[t4 + 1] = ay; pair[t4 + 2] = az; pair[t4 + 3] = W;
-        rho += W;
+        const j3 = nbr[t] * 3, t4 = t * 4;
+        const ax = pair[t4], ay = pair[t4 + 1], az = pair[t4 + 2];
+        rho += pair[t4 + 3];
         gx += ax; gy += ay; gz += az;
         sum2 += ax * ax + ay * ay + az * az;
         drho += (vxi - v[j3]) * ax + (vyi - v[j3 + 1]) * ay + (vzi - v[j3 + 2]) * az;
@@ -309,10 +287,15 @@ export class DFSPHSolver extends FluidCore {
     const xsph = 1 - Math.pow(1 - Math.min(u[U.viscosity], 0.99), frames);
     const fric = u[U.friction], invS = 1 / dp.spacing;
     const wantOmega = u[U.vorticity] > 0;
-    const gen = this.foamGen, ww = this.D > 0, invH = 1 / dp.h, invSurf = 1 / dp.wwSurfaceGrad;
+    const gen = this.foamGen, invH = 1 / dp.h, invSurf = 1 / dp.wwSurfaceGrad;
+    // whitewater potentials only where they can matter: the rate is zero
+    // below the kinetic-energy ramp (most of a calm or gently flowing body)
+    const ek0 = this.D > 0 ? 2 * dp.wwEnergy[0] : Infinity;
     for (let i = i0; i < i1; i++) {
       const i3 = i * 3;
       const vxi = v[i3], vyi = v[i3 + 1], vzi = v[i3 + 2];
+      const ww = vxi * vxi + vyi * vyi + vzi * vzi > ek0;
+      if (!ww && ek0 !== Infinity) gen[i] = 0;
       let ax = 0, ay = 0, az = 0, wx = 0, wy = 0, wz = 0;
       let ta = 0, cgx = 0, cgy = 0, cgz = 0;
       const base = i * M, e = base + cnt[i];

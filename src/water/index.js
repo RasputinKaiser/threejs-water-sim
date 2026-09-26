@@ -46,8 +46,7 @@ export const QUALITY = {
  *   colliders         static solver colliders (planes, containers, heightfields…)
  *   threads           'auto' | n | 0 (main thread)
  *   backend           'cpu' (default) | 'gpu' | 'auto' — WebGPU compute for the
- *                     DFSPH solver ('auto': WebGPU when available); no
- *                     whitewater on the GPU yet
+ *                     DFSPH solver ('auto': WebGPU when available)
  *   render            'screen' (default) | 'points' | false; look overrides in `look`
  *   workerFactory     custom Worker constructor (bundlers without module workers, tests)
  */

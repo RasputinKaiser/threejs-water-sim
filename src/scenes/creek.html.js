@@ -211,11 +211,11 @@ scene.add(wire);
 const bounds = { min: [-20, -3, -12], size: [40, 9, 24] };
 const pack = createWaterPack({
   scene, bounds,
-  // creek tuning (R3 research): livelier current (viscositySigma 40→8),
+  // creek tuning (R3 research): low viscosity keeps the current lively,
   // slippery riverbed + downhill assist so flow sustains on the 2% grade
   params: {
     h: 0.35, maxParticles: 26000,
-    viscositySigma: 8, viscosityBeta: 2,
+    viscositySigma: 1, viscosityBeta: 0.25,
     bedFriction: 0.05, slopeAssist: 0.8,
   },
   gui: harness.gui,

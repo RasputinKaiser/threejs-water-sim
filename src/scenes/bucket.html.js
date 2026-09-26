@@ -51,7 +51,7 @@ const bounds = { min: [-3.5, -0.5, -3.5], size: [7, 5, 7] };
 const pack = createWaterPack({
   scene, bounds,
   surfaceBounds: { min: [-2, -0.5, -2], size: [4, 3.5, 4] },
-  params: { h: 0.28, stiffness: 10, nearStiffness: 30, viscositySigma: 40, viscosityBeta: 8, maxParticles: 5000 },
+  params: { h: 0.28, stiffness: 10, nearStiffness: 30, viscositySigma: 4, viscosityBeta: 1, maxParticles: 5000 },
   substeps: 2,
   gui: harness.gui,
   waterline: { min: [-BW, 0, -BW], max: [BW, BH, BW] },

@@ -122,7 +122,7 @@ export function createAsyncSim({ params = {}, maxParticles = null, bounds = null
   }
 
   // Latest worker phase-profiling report (Lane F2): {batches, meanStepMs,
-  // perPhaseMs:{gravity,grid,pairs,viscosity,relax,collide,derive},
+  // perPhaseMs:{predict,sort,pairs,relax,scatter,collide,derive},
   // pairsPerStep, dominant} — posted by the worker every 30 batches.
   let _phaseStats = null;
 

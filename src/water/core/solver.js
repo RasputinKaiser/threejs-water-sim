@@ -77,6 +77,8 @@ export function allocateBuffers(dp, { alloc = (n) => new ArrayBuffer(n), threads
     density: f32(N), lambda: f32(N), omega: f32(N * 3),
     colliders: f32(maxColliders * COLLIDER_STRIDE),
     impulses: f64(threads * maxColliders * 6),
+    contacts: f64(threads * maxColliders * 4),   // per thread, per slot: [count, Σvx, Σvy, Σvz] this step
+    contactStats: f64(maxColliders * 4),         // per slot, last step: [count, mean vx, vy, vz]
   };
 }
 
@@ -111,6 +113,8 @@ export class PBFSolver {
     this.omega = new Float32Array(b.omega);
     this.colliders = new Float32Array(b.colliders);
     this.impulses = new Float64Array(b.impulses);
+    this.contacts = new Float64Array(b.contacts);
+    this.contactStats = new Float64Array(b.contactStats);
     this.heightfields = heightfields; // Float32Array per heightfield (packHeightfield layout)
 
     // thread-local scratch
@@ -353,11 +357,14 @@ export class PBFSolver {
       i = e;
     }
     if (overflow) Atomics.add(this.header, H.overflow, overflow);
-    this._collectCandidates(i0, i1);
+    this._collectCandidates(i0, i1, tid);
   }
 
-  // Colliders within reach of each particle this step (≤ MAX_COLLIDER_CANDIDATES).
-  _collectCandidates(i0, i1) {
+  // Colliders within reach of each particle this step (≤ MAX_COLLIDER_CANDIDATES),
+  // plus per-slot counts of particles touching dynamic colliders (contact shares).
+  _collectCandidates(i0, i1, tid) {
+    const contacts = this.contacts, conBase = tid * this.maxColliders * 4, v = this.vel;
+    const touch = this.p.particleRadius + 0.25 * this.p.spacing;
     const nc = this.header[H.colliders];
     const cand = this.cand, K = MAX_COLLIDER_CANDIDATES;
     const p = this.pos, rec = this.colliders, hf = this.heightfields, n = this._n;
@@ -367,7 +374,14 @@ export class PBFSolver {
       let k = 0;
       for (let c = 0; c < nc && k < K; c++) {
         const d = colliderSDF(rec, c, hf, p[i3], p[i3 + 1], p[i3 + 2], n);
-        if (d < reach) cand[base + k++] = c;
+        if (d < reach) {
+          cand[base + k++] = c;
+          const o = c * COLLIDER_STRIDE;
+          if (d < touch && (rec[o + F.flags] & FLAG_DYNAMIC)) {
+            const b = conBase + rec[o + F.slot] * 4;
+            contacts[b]++; contacts[b + 1] += v[i3]; contacts[b + 2] += v[i3 + 1]; contacts[b + 3] += v[i3 + 2];
+          }
+        }
       }
       if (k < K) cand[base + k] = -1;
     }
@@ -432,7 +446,9 @@ export class PBFSolver {
     const K = MAX_COLLIDER_CANDIDATES;
     const lam = this.lambda, out = this.tmpA;
     const imp = this.impulses, impBase = tid * this.maxColliders * 6;
-    const mOverDt = dp.particleMass / this.u[U.dt];
+    // the wall push reaches the particle scaled by ω in phaseApply, so its
+    // reaction on the collider must be scaled the same (momentum conservation)
+    const mOverDt = dp.particleMass / this.u[U.dt] * this.u[U.omega];
     for (let i = i0; i < i1; i++) {
       const i3 = i * 3;
       const xi = p[i3], yi = p[i3 + 1], zi = p[i3 + 2];
@@ -456,10 +472,10 @@ export class PBFSolver {
           if (c < 0) break;
           const d = colliderSDF(rec, c, hf, xi, yi, zi, n);
           if (d >= h) continue;
-          const s = li * wallFractionSlope(d, h); // λ_i ∂C/∂d along n
+          const o = c * COLLIDER_STRIDE;
+          const s = li * wallFractionSlope(d, h) * rec[o + F.alpha]; // λ_i ∂C/∂d along n
           const wx = s * n[0], wy = s * n[1], wz = s * n[2];
           sx += wx; sy += wy; sz += wz;
-          const o = c * COLLIDER_STRIDE;
           if (rec[o + F.flags] & FLAG_DYNAMIC) {
             addImpulse(imp, impBase + rec[o + F.slot] * 6, rec, o, xi, yi, zi,
               -wx * mOverDt, -wy * mOverDt, -wz * mOverDt);
@@ -478,7 +494,7 @@ export class PBFSolver {
   phaseApply(i0, i1, tid = 0) {
     const dp = this.p;
     const p = this.pos, dx = this.tmpA, pr = this.prev, m = this._cv;
-    const rad = dp.particleRadius;
+    const radStatic = dp.particleRadius, radDynamic = dp.dynamicRadius;
     const rec = this.colliders, hf = this.heightfields, cand = this.cand, n = this._n;
     const K = MAX_COLLIDER_CANDIDATES;
     const imp = this.impulses, impBase = tid * this.maxColliders * 6;
@@ -492,8 +508,9 @@ export class PBFSolver {
         const c = cand[cb + k];
         if (c < 0) break;
         let d = colliderSDF(rec, c, hf, x, y, z, n);
-        if (d >= rad) continue;
         const o = c * COLLIDER_STRIDE;
+        const rad = rec[o + F.flags] & FLAG_DYNAMIC ? radDynamic : radStatic;
+        if (d >= rad) continue;
         let sx = x, sy = y, sz = z; // surface-side reference point
         if (d < 0) {
           const d0 = colliderSDF(rec, c, hf, pr[i3], pr[i3 + 1], pr[i3 + 2], m);
@@ -503,7 +520,13 @@ export class PBFSolver {
             d = colliderSDF(rec, c, hf, sx, sy, sz, n);
           }
         }
-        const pen = rad - d;
+        // target: the contact skin rad outside the surface. With a contact
+        // share α < 1 (light dynamic body) only α of the skin depth is
+        // enforced, but a particle is always returned to the surface itself —
+        // softening the momentum exchange must never let fluid seep inside.
+        const a = rec[o + F.alpha];
+        const target = (d < 0 ? 0 : d) + a * (rad - (d < 0 ? 0 : d));
+        const pen = target - d;
         const mx = sx + pen * n[0] - x, my = sy + pen * n[1] - y, mz = sz + pen * n[2] - z;
         x += mx; y += my; z += mz;
         if (rec[o + F.flags] & FLAG_DYNAMIC) {
@@ -542,7 +565,8 @@ export class PBFSolver {
         colliderVelocity(rec, c, x, y, z, cv);
         const rx = x - pr[i3] - cv[0] * dt, ry = y - pr[i3 + 1] - cv[1] * dt, rz = z - pr[i3 + 2] - cv[2] * dt;
         const rn = rx * n[0] + ry * n[1] + rz * n[2];
-        const mx = -f * (rx - rn * n[0]), my = -f * (ry - rn * n[1]), mz = -f * (rz - rn * n[2]);
+        const fa = f * rec[o + F.alpha];
+        const mx = -fa * (rx - rn * n[0]), my = -fa * (ry - rn * n[1]), mz = -fa * (rz - rn * n[2]);
         x += mx; y += my; z += mz;
         if (rec[o + F.flags] & FLAG_DYNAMIC) {
           addImpulse(imp, impBase + rec[o + F.slot] * 6, rec, o, x, y, z,
@@ -691,6 +715,34 @@ export class PBFSolver {
     return out;
   }
 
+  // Mass-weighted contact for light dynamic bodies. The solver treats a
+  // collider as immovable within a step, so a particle it touches gets the
+  // collider's full velocity and the body receives the full reaction later:
+  // for a light body that is an elastic-plus kick (a 10 kg crate dropped at
+  // 2 m/s rebounded at 6 m/s). Splitting each correction as an inelastic
+  // contact between the body (mass M) and the N particles it touched last
+  // step gives particles the share α = M / (M + N·m). N is counted during
+  // candidate collection of this step (serial, after the neighbor phase).
+  _contactShares() {
+    const rec = this.colliders, nc = this.header[H.colliders], m = this.p.particleMass;
+    const C4 = this.maxColliders * 4, con = this.contacts, T = this.threads, cs = this.contactStats;
+    cs.fill(0);
+    for (let c = 0; c < nc; c++) {
+      const o = c * COLLIDER_STRIDE;
+      if (!(rec[o + F.flags] & FLAG_DYNAMIC)) { rec[o + F.alpha] = 1; continue; }
+      const s4 = rec[o + F.slot] * 4;
+      let N = 0, vx = 0, vy = 0, vz = 0;
+      for (let t = 0; t < T; t++) {
+        const b = t * C4 + s4;
+        N += con[b]; vx += con[b + 1]; vy += con[b + 2]; vz += con[b + 3];
+      }
+      if (N > 0) { cs[s4] = N; cs[s4 + 1] = vx / N; cs[s4 + 2] = vy / N; cs[s4 + 3] = vz / N; }
+      const M = rec[o + F.mass];
+      rec[o + F.alpha] = M > 0 ? M / (M + Math.max(1, N) * m) : 1;
+    }
+    con.fill(0);
+  }
+
   /* ================= driver ================= */
 
   /** Run one parallel phase over particles [i0, i1) as thread `tid`. */
@@ -733,6 +785,7 @@ export class PBFSolver {
       run(PHASE.gather);
       run(PHASE.scatterBack);
       run(PHASE.neighbors);
+      this._contactShares();
       const iters = this.u[U.iterations];
       for (let it = 0; it < iters; it++) {
         run(PHASE.lambda);

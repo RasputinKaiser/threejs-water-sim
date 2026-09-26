@@ -9,7 +9,8 @@
 // Record layout (see F.*):
 //   type · position xyz · rotation quat xyzw · size abc · linear velocity xyz ·
 //   angular velocity xyz · friction (<0: solver default) · flags · heightfield
-//   index · force slot (index into the impulse accumulator, <0: none)
+//   index · force slot (index into the impulse accumulator, <0: none) · mass
+//   (kg, dynamic bodies; 0 = infinitely heavy) · contact share α (solver-owned)
 
 export const COLLIDER_STRIDE = 24;
 
@@ -27,7 +28,7 @@ export const SHAPE = {
 export const F = {
   type: 0, px: 1, py: 2, pz: 3, qx: 4, qy: 5, qz: 6, qw: 7,
   sa: 8, sb: 9, sc: 10, vx: 11, vy: 12, vz: 13, wx: 14, wy: 15, wz: 16,
-  friction: 17, flags: 18, hf: 19, slot: 20,
+  friction: 17, flags: 18, hf: 19, slot: 20, mass: 21, alpha: 22,
 };
 
 export const FLAG_DYNAMIC = 1; // accumulate fluid impulses for rigid-body coupling
@@ -64,10 +65,13 @@ export function writeCollider(records, i, desc) {
   records[o + F.sa] = size[0] ?? 0; records[o + F.sb] = size[1] ?? 0; records[o + F.sc] = size[2] ?? 0;
   records[o + F.vx] = v[0]; records[o + F.vy] = v[1]; records[o + F.vz] = v[2];
   records[o + F.wx] = w[0]; records[o + F.wy] = w[1]; records[o + F.wz] = w[2];
+  const slot = desc.slot ?? (desc.dynamic ? i : -1);
   records[o + F.friction] = desc.friction ?? -1;
-  records[o + F.flags] = desc.dynamic ? FLAG_DYNAMIC : 0;
+  records[o + F.flags] = desc.dynamic && slot >= 0 ? FLAG_DYNAMIC : 0;
   records[o + F.hf] = desc.heightfield ?? -1;
-  records[o + F.slot] = desc.slot ?? (desc.dynamic ? i : -1);
+  records[o + F.slot] = slot;
+  records[o + F.mass] = desc.mass ?? 0;
+  records[o + F.alpha] = 1;
 }
 
 // q · v (unit quaternion rotation), written into out[0..2]

@@ -103,11 +103,12 @@ function coordinator(msg) {
       const ms = performance.now() - t0;
       publish(msg.frameId);
       solver.reduceImpulses(impulseOut);
-      const impulses = impulseOut.slice(0, (msg.colliders ?? solver.header[H.colliders]) * 6);
+      const impulses = impulseOut.slice();
+      const contacts = solver.contactStats.slice();
       const st = stats();
       st.phaseMs = Array.from(solver.phaseMs);
-      postMessage({ type: 'frame', frameId: msg.frameId, count: solver.header[H.count], ms, stats: st, impulses },
-        [impulses.buffer]);
+      postMessage({ type: 'frame', frameId: msg.frameId, count: solver.header[H.count], ms, stats: st, impulses, contacts },
+        [impulses.buffer, contacts.buffer]);
       break;
     }
     case 'spawn': {

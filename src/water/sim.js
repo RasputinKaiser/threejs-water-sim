@@ -20,6 +20,7 @@ import { deriveParams } from './core/params.js';
 import { PBFSolver, allocateBuffers, H, U } from './core/solver.js';
 import { COLLIDER_STRIDE, writeCollider, packHeightfield } from './core/colliders.js';
 import { CTL_SIZE } from './core/threads.js';
+import { mulberry32 } from 'math/random';
 
 const isNode = typeof process !== 'undefined' && !!process.versions?.node;
 
@@ -73,8 +74,12 @@ function makeBase(dp, opts) {
   };
 }
 
-// fillBox → Float32Array of [x,y,z,vx,vy,vz] on the solver's rest lattice
-export function latticeBox(dp, min, max, { velocity = [0, 0, 0], jitter = 0.01, random = Math.random } = {}) {
+// fillBox → Float32Array of [x,y,z,vx,vy,vz] on the solver's rest lattice.
+// jitter (fraction of spacing) breaks the perfect lattice; pass `seed` for a
+// reproducible fill.
+export function latticeBox(dp, min, max, { velocity = [0, 0, 0], jitter = 0.01, seed = null } = {}) {
+  const rng = mulberry32.create(seed ?? mulberry32.seed());
+  const random = () => mulberry32.sample(rng);
   const s = dp.spacing, j = jitter * s;
   // +1e-6: (1.2 − 0) / 0.1 is 11.999… in floating point
   const nx = Math.max(0, Math.floor((max[0] - min[0]) / s + 1e-6));
@@ -134,6 +139,7 @@ function createInline(dp, opts) {
 
   const sim = {
     mode: 'inline',
+    maxColliders: base.maxColliders,
     threads: 0,
     ready: Promise.resolve(),
     solver,
@@ -151,12 +157,16 @@ function createInline(dp, opts) {
       return { kineticEnergy: u[U.kineticEnergy], maxDensityError: u[U.maxDensityError], overflow: h[H.overflow],
         leaked: h[H.leaked], quarantined: h[H.quarantined], drained: h[H.drained] };
     },
-    /** Per-collider impulses [Jx,Jy,Jz, Lx,Ly,Lz] (N·s, about the collider origin) since the last read. */
+    /**
+     * Per-slot fluid impulses [Jx,Jy,Jz, Lx,Ly,Lz] (N·s, moments about the
+     * collider origin) accumulated since the last read over `time` seconds,
+     * plus the latest step's contacts per slot [count, mean fluid vx,vy,vz].
+     */
     takeImpulses() {
       const t = impulseTime; impulseTime = 0;
-      const out = impulses.slice(0, solver.header[H.colliders] * 6);
+      const out = impulses.slice(0, base.maxColliders * 6);
       impulses.fill(0);
-      return { impulses: out, time: t };
+      return { impulses: out, time: t, contacts: solver.contactStats.slice() };
     },
     setParams(patch) { solver.setUniforms(patch); },
     spawn(particles) {
@@ -234,6 +244,7 @@ async function createThreaded(dp, K, opts) {
   let collidersDirty = false;
   const impulseAcc = new Float64Array(base.maxColliders * 6);
   let impulseTime = 0;
+  let contactStats = new Float64Array(base.maxColliders * 4);
   const inflightSteps = [];
   let onFrame = null;
 
@@ -248,6 +259,7 @@ async function createThreaded(dp, K, opts) {
         const steps = inflightSteps.shift() ?? 0;
         impulseTime += steps * base.fixedDt;
         for (let i = 0; i < m.impulses.length; i++) impulseAcc[i] += m.impulses[i];
+        contactStats = m.contacts;
         onFrame?.(m);
       }
     });
@@ -283,6 +295,7 @@ async function createThreaded(dp, K, opts) {
   let owed = 0; // steps accumulated while the workers were busy
   const sim = {
     mode: 'threaded',
+    maxColliders: base.maxColliders,
     threads: K,
     ready,
     get params() { return dp; },
@@ -298,9 +311,9 @@ async function createThreaded(dp, K, opts) {
     get busy() { return busy; },
     takeImpulses() {
       const t = impulseTime; impulseTime = 0;
-      const out = impulseAcc.slice(0, collidersCount * 6);
+      const out = impulseAcc.slice();
       impulseAcc.fill(0);
-      return { impulses: out, time: t };
+      return { impulses: out, time: t, contacts: contactStats };
     },
     setParams(patch) { coord.postMessage({ type: 'params', patch }); },
     spawn(particles) { const d = toSpawnArray(particles); pendingSpawn.push(d); return d.length / 6; },

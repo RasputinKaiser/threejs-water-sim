@@ -29,6 +29,14 @@ export const DEFAULTS = {
 
   // --- boundaries --------------------------------------------------------
   friction: 0.1,         // tangential slip damping on collider contact, 0..1
+  // particle–collider contact distance, as a fraction of spacing. Static
+  // walls use half the spacing (the fluid volume ends exactly at the wall);
+  // dynamic bodies use less: a particle within the contact distance of a
+  // body's EDGE still pushes on it, which makes bodies act ~1 contact radius
+  // larger for buoyancy. Measured on a half-submerged 0.4 m box (spacing 0.1):
+  // 0.5 → 1.21–1.30× Archimedes, 0.35 → 0.97–1.09×.
+  collisionRadius: 0.5,
+  dynamicCollisionRadius: 0.35,
   wallDensity: true,     // colliders contribute density (no gap/sticking at walls)
   bounds: null,          // {min:[x,y,z], max:[x,y,z]}: particles leaving it are removed
 
@@ -100,7 +108,8 @@ export function deriveParams(user = {}) {
     invRho0: 1 / rho0,
     W0: k.K6 * k.h2 * k.h2 * k.h2,                 // self contribution W(0)
     epsilon: p.relaxation * grad2,                 // CFM term in the λ denominator
-    particleRadius: 0.5 * s,                       // collision radius
+    particleRadius: p.collisionRadius * s,         // contact distance, static/kinematic colliders
+    dynamicRadius: p.dynamicCollisionRadius * s,   // contact distance, dynamic bodies
     particleMass: p.waterDensity * s * s * s,      // kg, for rigid-body coupling
   };
 }

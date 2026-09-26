@@ -6,9 +6,9 @@
   "scripts": {
     "dev": "vite --port 5184 --strictPort",
     "build": "vite build",
-    "test": "node --test \"test/*.test.mjs\" && node src/water-pack/effects-smoke.mjs",
-    "fuzz": "node src/water-pack/fuzz/fuzz-solver.mjs",
-    "bench": "node src/water-pack/bench-report.mjs"
+    "test": "node --test \"test/*.test.mjs\"",
+    "fuzz": "node tools/fuzz.mjs",
+    "bench": "node tools/bench.mjs"
   },
   "dependencies": {
     "box3d.js": "^0.1.1",

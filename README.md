@@ -1,61 +1,128 @@
-# ThreeJS-Mods — Debug World
+# threejs-water-sim
 
-Box3D (Erin Catto's 3D physics, WASM via box3d.js) + three.js debug playground.
-Dev server: **http://localhost:5184**
+Drop-in, physically based particle water for three.js games, with optional
+two-way coupling to [Box3D](https://github.com/erincatto/box3d) (WASM via
+box3d.js). The solver is Position Based Fluids (Macklin & Müller 2013) on a
+spatial hash grid; it runs on worker threads when the page is cross-origin
+isolated and on the main thread otherwise. Rendering is a screen-space fluid
+pass with depth-based absorption, refraction and environment reflections.
 
-## Run
 ```
-npm run dev        # vite on port 5184
+npm install
+npm run dev        # labs on http://localhost:5184
 ```
 
-## Debug tooling built in
-- **HUD** (top-left): fps, sim ms, particle count, awake bodies, pool fill level + flatness σy (< 0.06 = settled flat)
-- **Console overlay** (bottom-left): captured console.error/warn; click header to expand. `window.pushDbg('msg')` logs into it.
-- **Screenshot**: press `P` → saves PNG to ~/Downloads
-- **Pause / step**: `Space` pauses the fixed-step loop, `.` advances one 60Hz tick
-- **lil-gui panels**: View toggles · Debug Draw (AABBs, contact points, velocity vectors, body axes) · 🚰 Water Sim (drop/splash/pour controls + fluid params) · 💧 Water Render (metaballs vs particles)
-- **`window.__dbg`** in devtools console: `{ b3, world, sim, harness, probe }`
+## Quick start
 
-## Agent-driven runs (no GUI needed)
-Append URL params — the page auto-captures canvas PNGs and POSTs them to the shot server:
-```
-node tools/shot-server.mjs                        # terminal 2 (saves to .shots/)
-open http://localhost:5184/?autoshot=3&label=test # shot every 3s → .shots/test-*.png
-```
-Params: `autoshot=<sec>` · `label=<name>` · `mode=particles` (speed-colored points) ·
-`pour=<particles/sec>` continuous pour · `autodrain=1` plughole draining.
-Then inspect the PNGs (they're real frames — preserveDrawingBuffer is on).
+```js
+import { createWater } from './src/water/index.js';
 
-## Tests & benchmarks
-```
-npm test           # solver regression tests + worker protocol test + effects smoke
-npm run fuzz       # adversarial solver fuzz suite (NaN injection, teleports, param chaos, ...)
-npm run bench      # per-phase solver profile at 8k–30k particles (sim.phaseMs)
-```
-CI (`.github/workflows/ci.yml`) runs tests, a shortened fuzz pass and the build.
+const water = await createWater({ renderer, scene, b3, world, quality: 'medium' });
+water.addCollider({ type: 'container', position: [0, 1, 0], size: [2, 1, 2] }); // open-top tank
+water.fillBox([-2, 0, -2], [2, 0.8, 2]);                                         // fill it
+const tap = water.addSource({ position: [0, 3, 0], direction: [0, -1, 0], radius: 0.15, speed: 3 });
 
-## Realistic dynamic water
-Clavet 2005 double-density relaxation solver in `src/water-pack/solver.js`.
-Each step sorts particles by grid cell into an internal working copy, so the
-neighbor walk reads contiguous memory; one pass builds the pair list and
-densities and applies the viscosity impulses; relaxation runs off the stored
-pairs. `pos`/`vel`/`nCount` keep their particle order for renderers.
-~40 ms/step at 26.5k particles on one core. Large scenes (creek) run it in a
-Web Worker (`workerSim: true`, needs the COOP/COEP headers the dev server sets).
-Per-step phase timings are on `sim.phaseMs`.
+function frame(dt) {
+  const simDt = water.update(dt);                      // fluid time advanced (fixed steps)
+  if (simDt > 0) b3.b3World_Step(world, simDt, 4);     // keep Box3D in lockstep with it
+  water.render(camera);                                // replaces renderer.render(scene, camera)
+}
+```
 
-Rendering: screen-space fluid (`src/water-pack/screen-fluid.js`: nearest-
-surface sphere splats → bilateral-smoothed depth → view-space normals →
-Fresnel/absorption composite, occluded by scene depth) or three.js
-MarchingCubes metaballs. Fill probe measures level + flatness σy; plughole
-drain with auto-drain toggle. Colliders mirror the Box3D static pool.
+`b3`/`world` are optional. With them, every Box3D body near the water becomes
+a collider each frame: static bodies are walls, kinematic bodies push water,
+dynamic bodies also receive the fluid's reaction (buoyancy, drag, splashes).
+A body of density ρ floats with about ρ/1000 of its volume submerged.
+
+### API
+
+| | |
+|---|---|
+| `createWater(opts)` | `renderer, scene, b3?, world?, quality: 'low'\|'medium'\|'high', params, colliders, threads: 'auto'\|n\|0, render: 'screen'\|'points'\|false, look` |
+| `water.update(dt)` | advance by real time `dt`; returns the fluid seconds simulated (0 while a worker batch is in flight) |
+| `water.render(camera, target?)` | draw the scene with water |
+| `water.fillBox(min, max, {velocity})` | fill a box at rest density |
+| `water.spawn(particles)` | `Float32Array [x,y,z,vx,vy,vz]*` or `[[x,y,z,vx?,vy?,vz?], …]` |
+| `water.removeInBox(min, max)`, `water.reset()` | remove water |
+| `water.addCollider(desc)` / `removeCollider(desc)` | `plane`, `box`, `sphere`, `capsule`, `container`; `position`, `rotation` (quat), `size` (half extents) / `radius` / `halfHeight`, `friction` |
+| `water.addHeightfield({minX, minZ, dx, dz, nx, nz, heights})` | terrain |
+| `water.addSource({position, direction, radius, speed})` | nozzle; flow = π·r²·speed m³/s. Handle has `enabled`, `speed`, `radius`, `position`, `direction`, `remove()` |
+| `water.addDrain({min, max})` | removes water entering the box every frame |
+| `water.surfaceHeight(x, z)` | water surface height near (x, z), `-Infinity` if dry |
+| `water.setParams(patch)` | `viscosity, vorticity, cohesion, friction, iterations, gravity, maxSpeed, bounds` |
+| `water.setLook(patch)` | `absorption, scatterColor, scatter, refraction, roughness, f0, envIntensity, …` |
+| `water.stats` | `stepMs, threads, maxDensityError, kineticEnergy, leaked, drained, colliders` |
+
+Quality presets (`src/water/index.js`): `low` 15 cm spacing, 3 iterations;
+`medium` 10 cm, 4 iterations; `high` 8 cm, 6 iterations. Override anything
+through `params` (`spacing`, `maxParticles`, `iterations`, …; see
+`src/water/core/params.js`).
+
+**Threads** need `SharedArrayBuffer`, i.e. the page must be served with
+`Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp` (the Vite config here sets both).
+Without them `createWater` silently falls back to the main thread.
+
+## Physics
+
+- **Incompressibility**: unilateral PBF density constraint, Jacobi iterations
+  with relaxation ω = 0.8, rest density taken from the emission lattice so
+  freshly spawned water is at rest. Solid walls contribute an analytic
+  density term, so water at a wall is neither sucked in nor pushed away.
+- **Hash grid**: particles are counting-sorted into a Teschner-hashed table
+  every step (cache-coherent neighbour walks, unbounded world, memory
+  proportional to particle count). Neighbour lists are exact — tested against
+  brute force including hash collisions.
+- **Viscosity** (XSPH), **vorticity confinement**, optional **cohesion**.
+- **Colliders** are signed distance fields with continuous exit along the
+  crossing path, so fast particles do not tunnel into or get stuck in solids.
+- **Box3D coupling**: per-body impulses from the solver's contact reactions,
+  mass-weighted contact response, and a per-frame impulse bound (Archimedes
+  + inelastic exchange) so light bodies are not launched.
+- **Determinism**: the threaded solver gives bit-identical results to the
+  single-threaded one.
+
+Measured on the 4-core CI-class VM this was developed on (`npm run bench`):
+8,000 particles ≈ 38 ms/step single-threaded, ≈ 18 ms/step on 3 threads.
+Cost scales linearly with particle count; a desktop CPU with more cores is
+proportionally faster.
+
+## Labs
+
+| page | what it tests |
+|---|---|
+| `index.html` — Pool Lab | Box3D pool, balls of 250–2000 kg/m³, crates, pour, plughole |
+| `bucket.html` | 1.2 m bucket at 5 cm spacing, spout fill, settling |
+| `pool.html` — Big Pool | 25 × 12.5 m pool, ~25k particles, waves |
+| `terrain.html` | heightfield valley, flow downhill into a basin |
+| `creek.html` | 40 m meandering channel, inflow nozzle + outflow drain |
+| `water-lab.html` | the pack used without the debug harness, as a game would |
+
+URL params: `quality=low|medium|high`, `render=screen|points`, `pour`.
+The labs share `src/scenes/water-harness.js` (fill probe, HUD, GUI).
+
+### Debug tooling
+- **HUD** (top-left): fps, particles, solver mode/threads, step time, density error, fill level and surface flatness
+- **Console overlay** (bottom-left): captured console.error/warn; `window.pushDbg('msg')` logs into it
+- **Screenshot**: `P` · **Pause / step**: `Space` / `.`
+- **`window.__dbg`** in the devtools console
+
+Agent-driven runs: `node tools/shot-server.mjs`, then open a lab with
+`?autoshot=<sec>&label=<name>` (PNGs in `.shots/`) and/or `?metrics=<label>`
+(JSON snapshots in `.metrics/`).
+
+## Tests & tools
+```
+npm test           # node:test suites: solver core, threads, Box3D buoyancy, createWater
+npm run fuzz       # adversarial fuzz (NaN injection, teleports, overlap, param chaos, …)
+npm run bench      # ms/step + per-phase split, single-threaded vs threaded
+```
+CI (`.github/workflows/ci.yml`) runs the tests, a shortened fuzz pass and the build.
 
 ## Files
-- `src/main.js` — Pool Lab: scene assembly, Box3D pool, spawn controls, HUD
-- `src/scenes/*.html.js` — Bucket, Terrain, Big Pool and Creek labs
-- `src/debug-harness.js` — camera/lights/HUD/console-capture/screenshot/fixed-timestep loop
-- `src/box3d-debug.js` — Box3D→three sync + AABB/contact/velocity debug draws
-- `src/water-pack/` — solver, worker sim (`sim-worker.mjs` + `async-sim.js`),
-  surfaces (metaballs, screen-space), foam effects, probes, fuzz + benches
-- `src/water-render.js` — Pool Lab metaball surface + particle rendering + fill probe
-- `test/` — `node:test` suites
+- `src/water/` — the pack: `index.js` (createWater), `sim.js` (threaded/inline runner),
+  `box3d.js` (coupling), `core/` (solver, colliders, params, worker), `render/screen-space.js`
+- `src/main.js`, `src/scenes/` — the labs
+- `src/debug-harness.js`, `src/box3d-debug.js` — lab harness and Box3D debug draw
+- `tools/` — fuzz, bench, screenshot server · `test/` — `node:test` suites
+- `research/` — design notes from earlier iterations (they describe the previous solver)

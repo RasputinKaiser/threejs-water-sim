@@ -1,7 +1,7 @@
 // test/helpers/worker-shim.mjs — runs a browser worker module inside a node
 // worker_threads Worker by mapping the worker globals it uses
 // (self / postMessage / addEventListener('message') / close) onto parentPort.
-// workerData.entry: module URL to load (default: the legacy water-pack worker).
+// workerData.entry: module URL of the worker to load.
 import { parentPort, workerData } from 'node:worker_threads';
 
 globalThis.self = globalThis;
@@ -11,4 +11,4 @@ globalThis.addEventListener = (type, fn) => {
 };
 globalThis.close = () => process.exit(0);
 
-await import(workerData?.entry ?? '../../src/water-pack/sim-worker.mjs');
+await import(workerData.entry);

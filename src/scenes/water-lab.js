@@ -92,10 +92,10 @@ const nozzle = water.addSource({ position: [1.0, 2.4, 1.0], direction: [-0.3, -1
 const gui = new GUI();
 gui.add(nozzle, 'enabled').name('pour');
 gui.add(nozzle, 'speed', 0.5, 8, 0.1).name('pour speed');
-const tune = { viscosity: water.params.viscosity, vorticity: water.params.vorticity, iterations: water.params.iterations };
+const tune = { viscosity: water.params.viscosity, vorticity: water.params.vorticity, tolerance: water.params.densityTolerance * 100 };
 gui.add(tune, 'viscosity', 0, 0.2, 0.005).onChange((v) => water.setParams({ viscosity: v }));
 gui.add(tune, 'vorticity', 0, 0.3, 0.005).onChange((v) => water.setParams({ vorticity: v }));
-gui.add(tune, 'iterations', 1, 10, 1).onChange((v) => water.setParams({ iterations: v }));
+gui.add(tune, 'tolerance', 0.02, 1, 0.01).name('density tol. %').onChange((v) => water.setParams({ densityTolerance: v / 100 }));
 gui.add({ splash: () => water.fillBox([-0.5, 1.4, -0.5], [0.5, 2.0, 0.5], { velocity: [0, -2, 0] }) }, 'splash').name('drop a block of water');
 gui.add({ reset: () => { water.reset(); water.fillBox([-P, 0, -P], [P, 0.5, P]); } }, 'reset');
 

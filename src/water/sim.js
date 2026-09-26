@@ -17,7 +17,8 @@
 // always per particle. Use `ids` for identity across frames.
 
 import { deriveParams } from './core/params.js';
-import { PBFSolver, allocateBuffers, H, U } from './core/solver.js';
+import { allocateBuffers, solverStats, H } from './core/fluid-core.js';
+import { createSolver } from './core/create-solver.js';
 import { COLLIDER_STRIDE, writeCollider, packHeightfield } from './core/colliders.js';
 import { CTL_SIZE } from './core/threads.js';
 import { mulberry32 } from 'math/random';
@@ -119,7 +120,7 @@ function createInline(dp, opts) {
   const base = makeBase(dp, opts);
   const heightfields = [];
   const buffers = allocateBuffers(dp, { maxColliders: base.maxColliders });
-  const solver = new PBFSolver(dp, buffers, { heightfields });
+  const solver = createSolver(dp, buffers, { heightfields });
   const impulses = new Float64Array(base.maxColliders * 6);
   const scratch = new Float64Array(base.maxColliders * 6);
   let impulseTime = 0;
@@ -153,11 +154,7 @@ function createInline(dp, opts) {
     get ids() { return solver.id; },
     get alpha() { return base.alpha; },
     get stepMs() { return lastMs; },
-    get stats() {
-      const u = solver.u, h = solver.header;
-      return { kineticEnergy: u[U.kineticEnergy], maxDensityError: u[U.maxDensityError], overflow: h[H.overflow],
-        leaked: h[H.leaked], quarantined: h[H.quarantined], drained: h[H.drained] };
-    },
+    get stats() { return solverStats(solver); },
     /**
      * Per-slot fluid impulses [Jx,Jy,Jz, Lx,Ly,Lz] (N·s, moments about the
      * collider origin) accumulated since the last read over `time` seconds,

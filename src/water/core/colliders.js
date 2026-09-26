@@ -140,6 +140,29 @@ export function colliderSDF(records, i, heightfields, x, y, z, out) {
   return d;
 }
 
+/**
+ * The five walls of container i as half-spaces: distance from (x,y,z) to each
+ * wall plane (positive on the fluid side) into d[0..4] and each wall's
+ * fluid-side world normal into n[0..14]. Solvers that sum boundary volume
+ * per wall use this instead of the nearest-wall SDF, which under-counts the
+ * wall where two walls meet and flips its normal discontinuously there.
+ */
+export function containerWalls(records, i, x, y, z, d, n) {
+  const o = i * COLLIDER_STRIDE;
+  const cx = records[o + 1], cy = records[o + 2], cz = records[o + 3];
+  const qx = records[o + 4], qy = records[o + 5], qz = records[o + 6], qw = records[o + 7];
+  rotate(-qx, -qy, -qz, qw, x - cx, y - cy, z - cz, _l);
+  const lx = _l[0], ly = _l[1], lz = _l[2];
+  const ex = records[o + 8], ey = records[o + 9], ez = records[o + 10];
+  d[0] = ex - lx; d[1] = ex + lx; d[2] = ez - lz; d[3] = ez + lz; d[4] = ey + ly;
+  for (let w = 0; w < 5; w++) {
+    const a = WALL_N[w];
+    rotate(qx, qy, qz, qw, a[0], a[1], a[2], _n);
+    n[w * 3] = _n[0]; n[w * 3 + 1] = _n[1]; n[w * 3 + 2] = _n[2];
+  }
+}
+const WALL_N = [[-1, 0, 0], [1, 0, 0], [0, 0, -1], [0, 0, 1], [0, 1, 0]];
+
 // Exact box SDF with outward gradient (local space).
 function boxSDF(lx, ly, lz, ex, ey, ez, n) {
   const ax = Math.abs(lx) - ex, ay = Math.abs(ly) - ey, az = Math.abs(lz) - ez;

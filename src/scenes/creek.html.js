@@ -218,8 +218,8 @@ const spacing = { low: 0.2, medium: 0.15, high: 0.12 }[quality] ?? 0.15;
 const water = await createWater({
   renderer: harness.renderer, scene, quality,
   render: qp.get('render') ?? 'screen',
-  // a slippery bed and low viscosity keep the current lively on a 2% grade
-  params: { spacing, maxParticles: 32768, friction: 0.05, viscosity: 0.005, bounds: { min: [-20, -3, -12], max: [20, 6, 12] } },
+  // a gravel bed: quadratic drag coefficient C_f 0.02
+  params: { spacing, maxParticles: 32768, friction: 0.02, bounds: { min: [-20, -3, -12], max: [20, 6, 12] } },
 });
 water.addHeightfield({ minX: -SIZE_X / 2, minZ: -SIZE_Z / 2, dx: DX, dz: DZ, nx: NX, nz: NZ, heights });
 

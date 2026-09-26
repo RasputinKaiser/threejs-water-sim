@@ -1,6 +1,6 @@
 // water/core/worker.js — worker entry for the threaded solver.
 //
-// Every worker builds a PBFSolver over the same SharedArrayBuffers. Worker 0
+// Every worker builds a solver (PBF or DFSPH) over the same SharedArrayBuffers. Worker 0
 // is the COORDINATOR: it receives commands from the main thread, runs the
 // serial parts of each step and dispatches parallel phases. Workers 1..K-1 are
 // HELPERS that sit in threads.helperLoop() executing their slice of each phase.
@@ -20,7 +20,8 @@
 // Uses only worker globals (self / postMessage / addEventListener), so the
 // same file runs in browsers and under node:worker_threads with a shim.
 
-import { PBFSolver, H, U } from './solver.js';
+import { H, solverStats } from './fluid-core.js';
+import { createSolver } from './create-solver.js';
 import { COLLIDER_STRIDE } from './colliders.js';
 import { CTL, OP_YIELD, OP_QUIT, makeParallel, broadcast, waitResumed, helperLoop } from './threads.js';
 
@@ -38,7 +39,7 @@ function initSolver(msg) {
   K = msg.threads;
   ctl = new Int32Array(msg.ctl);
   for (const b of msg.heightfields ?? []) heightfields.push(new Float32Array(b));
-  solver = new PBFSolver(msg.params, msg.buffers, { tid, init: false, heightfields });
+  solver = createSolver(msg.params, msg.buffers, { tid, init: false, heightfields });
 }
 
 /* ------------------------------ helper ------------------------------ */
@@ -79,14 +80,7 @@ function publish(frameId) {
   Atomics.store(pub.header, 3, frameId);
 }
 
-function stats() {
-  const u = solver.u, h = solver.header;
-  return {
-    kineticEnergy: u[U.kineticEnergy], maxDensityError: u[U.maxDensityError],
-    overflow: h[H.overflow], leaked: h[H.leaked], quarantined: h[H.quarantined],
-    drained: h[H.drained],
-  };
-}
+const stats = () => solverStats(solver);
 
 function coordinator(msg) {
   switch (msg.type) {

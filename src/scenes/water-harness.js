@@ -50,24 +50,31 @@ export function fillProbe(water, region) {
 /** Standard HUD line: fps, particles, solver mode/threads, step time. */
 export function waterHudLine(harness, water) {
   const s = water.stats;
+  const err = s.avgDensityError != null
+    ? `ρ err ${(s.avgDensityError * 100).toFixed(2)}%/${((s.maxDensityError ?? 0) * 100).toFixed(1)}%  it ${(s.pressureIterations ?? 0).toFixed(0)}×${s.substeps ?? 1}`
+    : `ρ err ${((s.maxDensityError ?? 0) * 100).toFixed(1)}%`;
   return `fps <b>${harness.fps.toFixed(0)}</b>  particles <b>${water.count}</b>  ` +
-    `${water.mode}${s.threads ? `×${s.threads}` : ''}  step <b>${(s.stepMs ?? 0).toFixed(1)}</b> ms  ` +
-    `ρ err ${((s.maxDensityError ?? 0) * 100).toFixed(1)}%`;
+    `${water.params.solver} ${water.mode}${s.threads ? `×${s.threads}` : ''}  step <b>${(s.stepMs ?? 0).toFixed(1)}</b> ms  ${err}`;
 }
 
 /** Solver + look controls in a lil-gui folder. */
 export function addWaterGui(gui, water, title = '💧 Water') {
   const f = gui.addFolder(title);
-  const p = water.params;
+  const p = water.params, dfsph = p.solver === 'dfsph';
   const t = {
     viscosity: p.viscosity, vorticity: p.vorticity, cohesion: p.cohesion,
-    friction: p.friction, iterations: p.iterations,
+    friction: p.friction, iterations: p.iterations, densityTolerance: p.densityTolerance * 100,
   };
   f.add(t, 'viscosity', 0, 0.2, 0.005).onChange((v) => water.setParams({ viscosity: v }));
   f.add(t, 'vorticity', 0, 0.3, 0.005).onChange((v) => water.setParams({ vorticity: v }));
-  f.add(t, 'cohesion', 0, 1, 0.01).onChange((v) => water.setParams({ cohesion: v }));
-  f.add(t, 'friction', 0, 1, 0.01).onChange((v) => water.setParams({ friction: v }));
-  f.add(t, 'iterations', 1, 10, 1).onChange((v) => water.setParams({ iterations: v }));
+  if (dfsph) {
+    f.add(t, 'friction', 0, 0.05, 0.001).name('bed drag C_f').onChange((v) => water.setParams({ friction: v }));
+    f.add(t, 'densityTolerance', 0.02, 1, 0.01).name('density tol. %').onChange((v) => water.setParams({ densityTolerance: v / 100 }));
+  } else {
+    f.add(t, 'cohesion', 0, 1, 0.01).onChange((v) => water.setParams({ cohesion: v }));
+    f.add(t, 'friction', 0, 1, 0.01).onChange((v) => water.setParams({ friction: v }));
+    f.add(t, 'iterations', 1, 10, 1).onChange((v) => water.setParams({ iterations: v }));
+  }
   const look = water.look;
   if (look) {
     const l = { scatter: look.scatter, roughness: look.roughness, refraction: look.refraction };

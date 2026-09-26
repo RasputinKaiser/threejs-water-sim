@@ -8,7 +8,7 @@
 // results. Phases take (i0, i1, tid); serial phases run on one thread.
 
 import { deriveParams } from './params.js';
-import { COLLIDER_STRIDE, F, FLAG_DYNAMIC, colliderSDF } from './colliders.js';
+import { COLLIDER_STRIDE, F, FLAG_DYNAMIC, colliderSDF, colliderNear } from './colliders.js';
 
 export const MAX_COLLIDER_CANDIDATES = 4;
 // per particle, per candidate collider (DFSPH boundary cache):
@@ -396,6 +396,7 @@ export class FluidCore {
       const i3 = i * 3, base = i * K;
       let k = 0;
       for (let c = 0; c < nc && k < K; c++) {
+        if (!colliderNear(rec, c, p[i3], p[i3 + 1], p[i3 + 2], reach)) continue;
         const d = colliderSDF(rec, c, hf, p[i3], p[i3 + 1], p[i3 + 2], n);
         if (d < reach) {
           cand[base + k++] = c;

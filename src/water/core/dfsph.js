@@ -35,7 +35,7 @@ import { generationRate, emitWhitewater, advectWhitewater } from './whitewater.j
 export const PHASE = {
   ...CORE_PHASE, hash: 20, density: 21, divergenceResidual: 22, velocity: 23,
   forces: 24, confine: 25, densityResidual: 26, integrate: 27,
-  warmDensity: 28, warmDivergence: 29, densityGate: 30, divergenceGate: 31, whitewater: 32,
+  warmDensity: 28, warmDivergence: 29, densityGate: 30, whitewater: 32,
 };
 
 // carried per-particle state (fluid-core carry slots): the total k each
@@ -103,7 +103,9 @@ export class DFSPHSolver extends FluidCore {
 
   /* ================= per-particle phases ================= */
 
-  // density, kernel cache, boundary cache, β
+  // density, kernel cache, boundary cache, β — and, for free, the current
+  // compression rate Dρ/Dt, which gates the divergence solve's warm start
+  // (kappa[i] > 0 where the particle is compressing)
   phaseDensity(i0, i1) {
     const dp = this.p;
     const p = this.pos, v = this.vel, nbr = this.nbr, cnt = this.nbrCount, M = this.M;
@@ -112,11 +114,13 @@ export class DFSPHSolver extends FluidCore {
     const pair = this.pair, bnd = this.bnd, dens = this.density, beta = this.beta;
     const rec = this.colliders, hf = this.heightfields, cand = this.cand, n = this._n, cv = this._cv;
     const Ft = this.bndF, dFt = this.bndDF, tInv = dp.bndInv, gv = this._g, id = this.id;
+    const kap = this.kappa, minN = dp.minNeighbors;
     const gMax = sigH * 2; // |dW/dr| at q = ⅓, the cubic kernel's steepest point
     for (let i = i0; i < i1; i++) {
       const i3 = i * 3;
       const xi = p[i3], yi = p[i3 + 1], zi = p[i3 + 2];
-      let rho = W0, gx = 0, gy = 0, gz = 0, sum2 = 0;
+      let rho = W0, gx = 0, gy = 0, gz = 0, sum2 = 0, drho = 0;
+      const vxi = v[i3], vyi = v[i3 + 1], vzi = v[i3 + 2];
       const base = i * M, e = base + cnt[i];
       for (let t = base; t < e; t++) {
         const j3 = nbr[t] * 3;
@@ -145,6 +149,7 @@ export class DFSPHSolver extends FluidCore {
         rho += W;
         gx += ax; gy += ay; gz += az;
         sum2 += ax * ax + ay * ay + az * az;
+        drho += (vxi - v[j3]) * ax + (vyi - v[j3 + 1]) * ay + (vzi - v[j3 + 2]) * az;
       }
       // boundaries: Ψ(d) from the lattice table, ∇(ρ0Ψ) = ρ0 Ψ'(d) n
       const cb = i * K;
@@ -174,11 +179,12 @@ export class DFSPHSolver extends FluidCore {
         bnd[b8] = bx; bnd[b8 + 1] = by; bnd[b8 + 2] = bz;
         bnd[b8 + 3] = cv[0]; bnd[b8 + 4] = cv[1]; bnd[b8 + 5] = cv[2];
         bnd[b8 + 6] = psi;
+        drho += (vxi - cv[0]) * bx + (vyi - cv[1]) * by + (vzi - cv[2]) * bz;
       }
       dens[i] = rho;
       const den = gx * gx + gy * gy + gz * gz + sum2;
       beta[i] = den > 1e-9 ? 1 / den : 0;
-      void v;
+      kap[i] = cnt[i] >= minN && drho > 0 ? 1 : 0;
     }
   }
 
@@ -500,7 +506,6 @@ export class DFSPHSolver extends FluidCore {
       case PHASE.density: return this.phaseDensity(i0, i1);
       case PHASE.divergenceResidual: return this.phaseResidual(i0, i1, tid, false);
       case PHASE.densityResidual: return this.phaseResidual(i0, i1, tid, true);
-      case PHASE.divergenceGate: return this.phaseResidual(i0, i1, tid, false, false);
       case PHASE.whitewater: return advectWhitewater(this, i0, i1, this.u[U.dt]);
       case PHASE.densityGate: return this.phaseResidual(i0, i1, tid, true, false);
       case PHASE.velocity: return this.phaseVelocity(i0, i1, tid);
@@ -557,14 +562,12 @@ export class DFSPHSolver extends FluidCore {
         // divergence-free solve
         const maxD = u[U.maxDivergenceIterations] | 0;
         if (maxD > 0) {
-          run(PHASE.divergenceGate);
-          this._sumReduce(R_ERR); this._maxReduce(R_MAX);
-          run(PHASE.warmDivergence);
+          run(PHASE.warmDivergence); // gated by the density pass
           run(PHASE.velocity);
           run(PHASE.divergenceResidual);
           let err = this._sumReduce(R_ERR) / n; this._maxReduce(R_MAX);
           const tol = u[U.divergenceTolerance] * dp.rho0;
-          for (let it = 0; it < maxD && (err > tol || it < 1); it++) {
+          for (let it = 0; it < maxD && err > tol; it++) {
             run(PHASE.velocity);
             run(PHASE.divergenceResidual);
             err = this._sumReduce(R_ERR) / n; this._maxReduce(R_MAX);

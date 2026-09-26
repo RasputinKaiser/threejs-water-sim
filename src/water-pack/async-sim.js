@@ -129,6 +129,7 @@ export function createAsyncSim({ params = {}, maxParticles = null, bounds = null
   // Worker-reported per-frame stats (updated on every 'frame' message; before
   // the first step they hold sync-path defaults so HUD code can rely on them).
   let leakedTotal = 0;
+  let drainedTotal = 0;
   let kineticEnergy = 0;
 
   // Interpolation bookkeeping (main thread): when the curr frame landed +
@@ -196,6 +197,7 @@ export function createAsyncSim({ params = {}, maxParticles = null, bounds = null
       }
       _lastFrameArrival = now;
       if (m.leakedTotal != null) leakedTotal = m.leakedTotal;
+      if (m.drainedTotal != null) drainedTotal = m.drainedTotal;
       if (m.ke != null) kineticEnergy = m.ke;
       const pf = pendingFrames.get(m.frameId);
       if (pf) {
@@ -355,6 +357,8 @@ export function createAsyncSim({ params = {}, maxParticles = null, bounds = null
     /** Cumulative out-of-bounds removals — worker-reported each step frame
      * (one frame of latency vs the sync path's immediate value). */
     get leakedTotal() { return leakedTotal; },
+    /** Cumulative particles removed by drain() (worker-reported each frame). */
+    get drainedTotal() { return drainedTotal; },
     /** Total kinetic energy — worker-reported each step frame. */
     get kineticEnergy() { return kineticEnergy; },
 

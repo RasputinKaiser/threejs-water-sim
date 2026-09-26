@@ -198,6 +198,8 @@ test('drain returns the number removed; reset empties the sim', () => {
   const removed = sim.drain({ min: [-10, -1, -10], max: [0, 10, 10] });
   assert.ok(removed > 0 && removed < 216);
   assert.equal(sim.count, 216 - removed);
+  assert.equal(sim.drain({ min: [-10, -1, -10], max: [0, 10, 10] }), 0, 'region already empty');
+  assert.equal(sim.drainedTotal, removed);
   sim.reset();
   assert.equal(sim.count, 0);
   assert.equal(sim.spawn(0, 1, 0), true, 'spawn after reset');

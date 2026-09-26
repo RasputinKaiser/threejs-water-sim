@@ -83,8 +83,10 @@ test('worker: init, spawn, step batches, flip, phase report, drain, reset', asyn
     w.worker.postMessage({ type: 'drain', region: { min: [-10, -2, -10], max: [0, 10, 10] } });
     let p = w.next('frame');
     w.worker.postMessage({ type: 'step', dt: 1 / 60, steps: 1, fixedSteps: true, frameId: 33 });
-    const afterDrain = (await p).count;
+    const drainFrame = await p;
+    const afterDrain = drainFrame.count;
     assert.ok(afterDrain > 0 && afterDrain < 1000, `drained to ${afterDrain}`);
+    assert.equal(drainFrame.drainedTotal, 1000 - afterDrain, 'worker reports drainedTotal');
     w.worker.postMessage({ type: 'reset' });
     p = w.next('frame');
     w.worker.postMessage({ type: 'step', dt: 1 / 60, steps: 1, fixedSteps: true, frameId: 34 });

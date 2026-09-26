@@ -22,11 +22,15 @@
 // composites water on top of the live canvas contents.
 //
 // Pipeline (all internal RTs are HALF resolution, HalfFloat RGBA):
-//   1. points depth pass    -> eye-linear front-cap depth (MAX blending)
+//   1. points depth pass    -> RECIPROCAL front-cap view depth 1/z with MAX
+//      blending (largest 1/z = nearest surface; 0 = no water)
 //   1b. points thickness    -> additive gaussian-falloff thickness
-//   2. separable bilateral blur (H then V) on the depth; the V-pass also
-//      blends with last frame's result (temporal smoothing, ping-pong RTs)
-//   3. fullscreen normal reconstruction (finite differences)
+//   2. separable bilateral blur (H then V) on the depth, footprint scaled to
+//      the projected particle size, empty texels excluded; the H-pass turns
+//      1/z back into z and the V-pass blends with last frame's result
+//      (temporal smoothing, ping-pong RTs)
+//   3. fullscreen normal reconstruction from view-space positions (one-sided
+//      differences, never across a silhouette)
 //   4. fullscreen composite -> Fresnel reflection (sky + mirrored scene),
 //      refracted scene with Beer-Lambert absorption (depth-tinted: murky
 //      shallow -> deep colour), flow-advected detail waves perturbing the
@@ -42,14 +46,6 @@
 // When sim.count === 0 nothing is drawn.
 
 import * as THREE from 'three';
-
-// Decode a half-float bit pattern to a JS number (for HalfFloat RT readback).
-function f16toF32(h) {
-  const s = (h & 0x8000) >> 15, e = (h & 0x7c00) >> 10, f = h & 0x3ff;
-  if (e === 0) return (s ? -1 : 1) * Math.pow(2, -14) * (f / 1024);
-  if (e === 31) return f ? NaN : (s ? -Infinity : Infinity);
-  return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / 1024);
-}
 
 /* ------------------------------------------------------------------ */
 /* Shaders                                                             */
@@ -72,28 +68,26 @@ precision highp float;
 attribute vec3 position;
 uniform mat4 modelViewMatrix;
 uniform mat4 projectionMatrix;
-uniform float uRadius;     // world-space particle radius (~h*0.55)
+uniform float uRadius;     // world-space particle radius (depth relief)
+uniform float uSpriteScale; // sprite footprint radius = uRadius * uSpriteScale
 uniform float uProj11;     // projectionMatrix[1][1]
-uniform float uViewportH;  // drawing-buffer height in px
-varying float vDist;       // eye-linear distance to sphere centre
+uniform float uViewportH;  // height in px of the RT the sprites render into
+varying float vDist;       // view depth of the sphere centre
 void main() {
   vec4 mv = modelViewMatrix * vec4(position, 1.0);
   float dist = max(0.1, -mv.z);
   vDist = dist;
-  // projected diameter in px: (2r * proj11 / dist) * (H/2)
-  float ps = uRadius * uProj11 * uViewportH / dist;
+  // projected diameter in px: (2R * proj11 / dist) * (H/2), R = footprint radius
+  float ps = uRadius * uSpriteScale * uProj11 * uViewportH / dist;
   gl_PointSize = clamp(ps, 1.0, 512.0);
   gl_Position = projectionMatrix * mv;
 }`;
 
-// Front-cap depth: eye-linear distance from camera to nearest point of the
-// sphere along the ray through this fragment. Written with MAX blending so
-// the RT ends up holding the nearest surface (no z-buffer gymnastics needed
-// for point sprites — every fragment of a sprite shares the vertex depth).
-// NOTE on the "empty" sentinel: we clear to 0 and treat wd <= EPS as no-water.
-// The old scheme (clear to CLEAR_DIST=10000, test wd > CLEAR_DIST*0.75) broke
-// because THREE.Color.setRGB clamps through color-space conversion, so the
-// clear actually wrote ~1.0 — making EVERY pixel look like water.
+// Front-cap depth: view depth z of the nearest point of the sphere along
+// the ray through this fragment. Point sprites share one vertex depth, so
+// there is no z-buffer; instead the pass stores 1/z with MAX blending, which
+// keeps the NEAREST surface per pixel (MAX of z itself would keep the
+// farthest, i.e. shade the back of the fluid). The RT clears to 0 = empty.
 const DEPTH_FS = /* glsl */ `
 precision highp float;
 uniform float uRadius;
@@ -102,8 +96,8 @@ void main() {
   vec2 p = gl_PointCoord * 2.0 - 1.0;
   float r2 = dot(p, p);
   if (r2 > 1.0) discard;
-  float zOff = uRadius * sqrt(max(0.0, 1.0 - r2));
-  gl_FragColor = vec4(max(0.05, vDist - zOff), 0.0, 0.0, 1.0);
+  float z = max(0.05, vDist - uRadius * sqrt(1.0 - r2));
+  gl_FragColor = vec4(1.0 / z, 0.0, 0.0, 1.0);
 }`;
 
 // Thickness: additive gaussian falloff per sprite; accumulated in R.
@@ -133,57 +127,76 @@ uniform sampler2D tPrev;   // last frame's smoothed depth (ping-pong)
 uniform float uTemporalAlpha; // 0 = off, ~0.35 = subtle ghost-tolerant blend
 uniform vec2 uTexel;   // 1/rtSize
 uniform vec2 uDir;     // (1,0) horizontal pass, (0,1) vertical pass
-uniform float uSigmaR; // range sigma (eye-linear units)
+uniform float uSigmaR; // range sigma (view-depth units, m)
+uniform float uRecip;  // 1: input holds 1/z (raw depth pass), 0: input holds z
+uniform float uRadiusPx; // projected particle radius in texels at z = 1 m
 varying vec2 vUv;
 
+float readZ(vec2 uv) {
+  float v = texture2D(uTex, uv).r;
+  return uRecip > 0.5 ? (v > 0.0 ? 1.0 / v : 0.0) : v;
+}
+
 void main() {
-  float d0 = texture2D(uTex, vUv).r;
-  if (d0 > 9000.0) { gl_FragColor = vec4(d0, 0.0, 0.0, 1.0); return; }
-  // 9-tap gaussian spatial weights (sigma ~ 2 px)
+  float d0 = readZ(vUv);
+  if (d0 <= 0.0) { gl_FragColor = vec4(0.0); return; } // no water here
+  // 9-tap gaussian spatial weights (sigma ~ 2 taps). The tap spacing follows
+  // the projected particle size so the kernel spans ~1 particle radius at
+  // any distance (a fixed 1-texel step left every sphere bump in place).
+  // Integer spacing keeps taps on texel centers: linear filtering would mix
+  // depths with empty (0) texels at silhouettes.
+  float stp = floor(clamp(uRadiusPx / d0 * 0.3, 1.0, 4.0));
   float w[5];
   w[0] = 0.227027; w[1] = 0.194594; w[2] = 0.121621; w[3] = 0.054054; w[4] = 0.016216;
   float inv2s2 = 1.0 / (2.0 * uSigmaR * uSigmaR);
   float sum = d0 * w[0];
   float wsum = w[0];
   for (int i = 1; i <= 4; i++) {
-    float fi = float(i);
-    vec2 off = uDir * uTexel * fi;
-    float dA = texture2D(uTex, vUv + off).r;
-    float dB = texture2D(uTex, vUv - off).r;
-    float wA = w[i] * exp(-(dA - d0) * (dA - d0) * inv2s2);
-    float wB = w[i] * exp(-(dB - d0) * (dB - d0) * inv2s2);
+    vec2 off = uDir * uTexel * float(i) * stp;
+    float dA = readZ(vUv + off);
+    float dB = readZ(vUv - off);
+    float wA = dA > 0.0 ? w[i] * exp(-(dA - d0) * (dA - d0) * inv2s2) : 0.0;
+    float wB = dB > 0.0 ? w[i] * exp(-(dB - d0) * (dB - d0) * inv2s2) : 0.0;
     sum += dA * wA + dB * wB;
     wsum += wA + wB;
   }
-  float d = wsum > 0.0001 ? sum / wsum : d0;
-  // temporal blend: keep some of last frame's smoothed depth. History is
-  // only trusted when it looks like real water depth (sentinel is 0, the
-  // legacy clear-distance sentinel was ~10000) — otherwise use d so a
-  // cold history can never pull depths toward garbage.
+  float d = sum / wsum;
+  // temporal blend: keep some of last frame's smoothed depth where that
+  // history holds water (0 = none) at a similar depth
   float pv = texture2D(tPrev, vUv).r;
-  pv = (pv > 0.02 && pv < 9000.0) ? pv : d;
+  pv = (pv > 0.0 && abs(pv - d) < 4.0 * uSigmaR) ? pv : d;
   gl_FragColor = vec4(mix(d, pv, uTemporalAlpha), 0.0, 0.0, 1.0);
 }`;
 
-// View-space normal from the smoothed eye-linear depth via central
-// differences. Stored raw (signed) in RGB of a HalfFloat RT.
+// View-space normal from the smoothed view depth: rebuild view-space
+// positions (so the slope has the right scale at every depth — raw depth
+// differences per texel flattened slopes by ~1/texel-size) and difference
+// toward the neighbor with the smaller depth jump, skipping empty texels, so
+// silhouettes never produce the steep bogus normals that shaded as dark rims.
+// RGB = normal (signed, HalfFloat RT), A = 1 where water exists.
 const NORMAL_FS = /* glsl */ `
 precision highp float;
 uniform sampler2D uTex;
 uniform vec2 uTexel;
+uniform vec2 uInvProj; // (1/P[0][0], 1/P[1][1])
 varying vec2 vUv;
+
+vec3 viewPos(vec2 uv, float z) { return vec3((uv * 2.0 - 1.0) * uInvProj * z, -z); }
+
 void main() {
-  float dL = texture2D(uTex, vUv - vec2(uTexel.x, 0.0)).r;
-  float dR = texture2D(uTex, vUv + vec2(uTexel.x, 0.0)).r;
-  float dB = texture2D(uTex, vUv - vec2(0.0, uTexel.y)).r;
-  float dT = texture2D(uTex, vUv + vec2(0.0, uTexel.y)).r;
-  if (min(min(dL, dR), min(dB, dT)) > 9000.0) {
-    gl_FragColor = vec4(0.0, 0.0, 1.0, 1.0);
-    return;
-  }
-  // height-field slope in eye space; uniform per-pixel scale cancels out
-  vec3 n = normalize(vec3(dR - dL, dT - dB, 2.0));
-  gl_FragColor = vec4(n, 1.0);
+  float z0 = texture2D(uTex, vUv).r;
+  if (z0 <= 0.0) { gl_FragColor = vec4(0.0, 0.0, 1.0, 0.0); return; }
+  vec2 ox = vec2(uTexel.x, 0.0), oy = vec2(0.0, uTexel.y);
+  float zl = texture2D(uTex, vUv - ox).r, zr = texture2D(uTex, vUv + ox).r;
+  float zb = texture2D(uTex, vUv - oy).r, zt = texture2D(uTex, vUv + oy).r;
+  vec3 p0 = viewPos(vUv, z0);
+  vec3 dx = vec3(2.0 * uTexel.x * uInvProj.x * z0, 0.0, 0.0); // flat fallback
+  if (zr > 0.0 && (zl <= 0.0 || abs(zr - z0) < abs(z0 - zl))) dx = viewPos(vUv + ox, zr) - p0;
+  else if (zl > 0.0) dx = p0 - viewPos(vUv - ox, zl);
+  vec3 dy = vec3(0.0, 2.0 * uTexel.y * uInvProj.y * z0, 0.0);
+  if (zt > 0.0 && (zb <= 0.0 || abs(zt - z0) < abs(z0 - zb))) dy = viewPos(vUv + oy, zt) - p0;
+  else if (zb > 0.0) dy = p0 - viewPos(vUv - oy, zb);
+  gl_FragColor = vec4(normalize(cross(dx, dy)), 1.0);
 }`;
 
 // Composite: Fresnel-weighted reflection + refraction with Beer-Lambert
@@ -194,8 +207,9 @@ const COMPOSITE_FS = /* glsl */ `
 precision highp float;
 uniform sampler2D tScene;      // scene colour (full res)
 uniform sampler2D tSceneDepth; // scene DepthTexture (nonlinear 0..1)
-uniform sampler2D tWaterDepth; // smoothed eye-linear water depth (half res)
+uniform sampler2D tWaterDepth; // smoothed view depth z of the water front (half res, 0 = none)
 uniform sampler2D tNormal;     // view-space normal (half res)
+uniform vec2 uInvProj;         // (1/P[0][0], 1/P[1][1]) — view rays
 uniform sampler2D tThick;      // accumulated thickness (half res)
 uniform float uNear;
 uniform float uFar;
@@ -213,6 +227,7 @@ uniform float uShininess;
 uniform float uFresnel0;
 uniform float uEdgeSoft;       // eye-linear units for edge fade
 uniform float uThickScale;     // thickness accumulation -> world units
+uniform float uThinCut;        // raw thickness at which a sprite edge is opaque
 uniform float uDebugTint;      // >0: output red where water depth exists (debug)
 uniform vec2  uFlowDirVS;      // world XZ flow dir projected into VIEW space (xy)
 uniform float uFlowSpeed;      // advection speed multiplier
@@ -267,28 +282,43 @@ float sceneDist(vec2 uv) {
   return (2.0 * uNear * uFar) / (uFar + uNear - ndcZ * (uFar - uNear));
 }
 
-void main() {
-  float wd = texture2D(tWaterDepth, vUv).r;
-  float thickRaw = texture2D(tThick, vUv).r;
-  // empty sentinel is 0 (cleared buffer); real depths are always >= 0.05.
-  // BUT at grazing angles the MAX-blended depth of thin sheets can blur down
-  // below 0.02 eye-units while real water is still there — so a pixel only
-  // counts as empty when the thickness RT is ALSO empty there. tThick is
-  // additive gaussian accumulation, so any value > ~0.001 means particles
-  // rasterized here; this keeps thin/grazing sheets alive instead of
-  // discarding them into patchy holes near banks and obstacles.
-  if (wd < 0.02 && thickRaw <= 0.001) {
-    gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0); return;
-  }
-  if (uDebugTint > 0.0) { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); return; }
+// One tap of the validity-weighted bilinear fetch below.
+void waterTap(vec2 uv, float w, inout float z, inout vec3 nrm, inout float cov) {
+  float d = texture2D(tWaterDepth, uv).r;
+  float wk = d > 0.0 ? w : 0.0;
+  z += d * wk;
+  nrm += texture2D(tNormal, uv).xyz * wk;
+  cov += wk;
+}
 
+void main() {
+  // Validity-weighted bilinear upsample of the half-res depth + normal:
+  // hardware filtering would average real depths with empty (0) texels at
+  // silhouettes (bogus mid depths, stair-stepped dark outlines). cov is the
+  // fraction of bilinear weight on water texels — a smooth coverage value
+  // that anti-aliases the silhouette.
+  vec2 st = vUv / uTexel - 0.5;
+  vec2 f = fract(st);
+  vec2 uv0 = (floor(st) + 0.5) * uTexel;
+  float wd = 0.0, cov = 0.0;
+  vec3 nSum = vec3(0.0);
+  waterTap(uv0,                            (1.0 - f.x) * (1.0 - f.y), wd, nSum, cov);
+  waterTap(uv0 + vec2(uTexel.x, 0.0),      f.x * (1.0 - f.y),         wd, nSum, cov);
+  waterTap(uv0 + vec2(0.0, uTexel.y),      (1.0 - f.x) * f.y,         wd, nSum, cov);
+  waterTap(uv0 + uTexel,                   f.x * f.y,                 wd, nSum, cov);
+  if (cov < 0.02) { gl_FragColor = vec4(0.0); return; }
+  wd /= cov;
+  if (uDebugTint > 0.0) { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); return; }
+  vec3 n = normalize(nSum);
+  // unit vector from the surface toward the camera (view space)
+  vec3 V = -normalize(vec3((vUv * 2.0 - 1.0) * uInvProj, -1.0));
+
+  float thickRaw = texture2D(tThick, vUv).r;
   float thick = min(thickRaw * uThickScale, 4.0);
   // thickness floor for SHADING: additive accumulation can round to ~0 at
   // silhouettes and grazing sheets, making absorption/color collapse to
-  // "no water". Give shading a small effective thickness derived from the
-  // (already-validated) water depth so grazing sheets still read as water.
-  thick = max(thick, min(0.25, wd * 0.8));
-  vec3 n = normalize(texture2D(tNormal, vUv).xyz);
+  // "no water"
+  thick = max(thick, 0.25);
 
   // Droplet shading: isolated balls have steep dome-edge normals that shade
   // as dark rings (fresnel + spec at near-grazing dome slopes). Keep the dome
@@ -331,7 +361,7 @@ void main() {
   // surface and the horizon reads as a flat mirror. Fine cross-flow ripple
   // trains perturb the normal BEFORE fresnel; amplitude is gated by
   // (1 - N.z)^2 so steep views stay calm and only grazing angles light up.
-  float ndv = clamp(dot(n, vec3(0.0, 0.0, 1.0)), 0.0, 1.0);
+  float ndv = clamp(dot(n, V), 0.0, 1.0);
   float gAmp = uRippleDetail * pow(1.0 - ndv, 2.0);
   if (gAmp > 1e-4) {
     float qa = dot(pw, fp) * 6.5 - ft * 7.0 + dot(pw, fd) * 1.4;
@@ -371,16 +401,13 @@ void main() {
   // soft edge: fade where water surface nearly coincides with the solid
   // surface behind it (container walls) or is occluded by nearer geometry
   float sd = sceneDist(vUv);
-  float edge = smoothstep(0.0, uEdgeSoft, sd - wd);
+  // occlusion: scene geometry in front of the water surface hides it (the
+  // tolerance absorbs the half-res vs full-res depth mismatch along walls)
+  float occl = clamp((sd - wd) / (0.03 + 0.004 * wd) + 1.0, 0.0, 1.0);
   // thin-sheet visibility floor: where sd ≈ wd (shallow sheets over terrain,
-  // grazing view angles) edge→0 would make the water fully transparent and
-  // thin bodies vanish entirely. Blend toward a minimum alpha wherever ANY
-  // real depth exists so shallow/grazing water stays ≥85% visible.
-  // Droplet mode: isolated balls reach high alpha FAST (steep curve on small
-  // wd) so their rims don't read as semi-transparent ghost rings over bright
-  // terrain — they read as solid droplets instead.
-  float thin = clamp(wd / 0.06, 0.0, 1.0);
-  edge = max(edge, thin * 0.95);
+  // grazing view angles) the fade alone would make thin bodies vanish, so
+  // shallow water stays ≥85% visible.
+  float edge = max(smoothstep(0.0, uEdgeSoft, sd - wd), 0.85);
   float edgeBand = 1.0 - edge;   // 1 right at the bank
 
   // --- depth-tinted refraction -------------------------------------------
@@ -417,15 +444,14 @@ void main() {
   vec3 refr = sceneCol * T + body * (1.0 - tAvg);
 
   // --- reflection -----------------------------------------------------
-  vec3 vDir = normalize(vec3((vUv - 0.5) * vec2(1.7, 1.0), -1.6));
-  vec3 rDir = reflect(vDir, n);
+  vec3 rDir = reflect(-V, n);
   float t01 = clamp(rDir.y * 0.5 + 0.5, 0.0, 1.0);
   vec3 sky = mix(uHorizonColor, uSkyColor, t01);
   vec2 muv = clamp(vUv - n.xy * uReflect * 2.0, vec2(0.002), vec2(0.998));
   vec3 reflS = texture2D(tScene, muv).rgb;
   vec3 refl = mix(sky, reflS, 0.25);
 
-  float cosT = clamp(dot(n, vec3(0.0, 0.0, 1.0)), 0.0, 1.0);
+  float cosT = clamp(dot(n, V), 0.0, 1.0);
   float fres = uFresnel0 + (1.0 - uFresnel0) * pow(1.0 - cosT, 5.0);
   // Remove the hard white outline: grazing-angle fresnel is what paints
   // container banks white. Damp it towards the edge; noise-gated foam
@@ -440,7 +466,7 @@ void main() {
   // --- anisotropic (flow-stretched) specular -----------------------------
   // Flatten the normal's along-flow component before the half-vector dot:
   // the highlight smears along the flow direction and reads as current.
-  vec3 hv = normalize(uLightDirVS + vec3(0.0, 0.0, 1.0));
+  vec3 hv = normalize(uLightDirVS + V);
   vec3 ns = normalize(vec3(fd * (dot(n.xy, fd) * uSpecStretch)
                          + fp * dot(n.xy, fp),
                            max(n.z, 0.15)));
@@ -504,7 +530,11 @@ void main() {
   // the rim reads as clear thin water instead of a hard alpha outline.
   col = mix(texture2D(tScene, vUv).rgb, col, smoothstep(0.0, 0.45, edge));
 
-  gl_FragColor = vec4(col, edge);
+  // Sprite footprints are wider than the particles, so a lone particle's
+  // halo bleeds past the water (over rims, into the air). Bulk water piles
+  // up thickness; halo edges have almost none — fade those out.
+  float solid = smoothstep(0.0, uThinCut, thickRaw);
+  gl_FragColor = vec4(col, edge * occl * solid * smoothstep(0.02, 0.5, cov));
 }`;
 
 /* ------------------------------------------------------------------ */
@@ -529,14 +559,18 @@ export function createScreenFluid(sim, renderer, scene, bounds, opts = {}) {
   // under any camera motion (water slides in screen space), which reads as
   // tracers/ghosting. 0.18 is enough to mask per-frame particle jitter
   // without visible smear; users can zero it via GUI 'temporal smooth'.
+  // blurSigma: bilateral depth-range sigma as a multiple of the particle
+  // radius — depth steps well above it (separate bodies) stay sharp, the
+  // per-particle bumps below it are smoothed away.
   const state = { enabled: true, flowAngleDeg: 0, temporalAlpha: 0.18,
-                  adaptiveTemporal: true };
+                  adaptiveTemporal: true, blurSigma: 1.0 };
 
   const bufSize = renderer.getDrawingBufferSize(new THREE.Vector2());
-  const HW = Math.max(4, Math.floor(bufSize.width * resolutionScale));
-  const HH = Math.max(4, Math.floor(bufSize.height * resolutionScale));
+  const _bufNow = new THREE.Vector2();
+  let HW = Math.max(4, Math.floor(bufSize.width * resolutionScale));
+  let HH = Math.max(4, Math.floor(bufSize.height * resolutionScale));
 
-  const CLEAR_DIST = 10000.0; // "no water" sentinel in eye-linear units
+  const CLEAR_DIST = 10000.0; // legacy uniform value (unused by the shaders)
 
   /* ---- internal render targets (half res, HalfFloat, no depth) ------ */
   const rtOpts = {
@@ -578,10 +612,14 @@ export function createScreenFluid(sim, renderer, scene, bounds, opts = {}) {
   pointsGeo.setAttribute('position', posAttr);
   pointsGeo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), Infinity);
 
+  // Sprites cover 2× the depth-relief radius (historically a side effect of
+  // sizing half-res sprites by the full-res height, and what the look is
+  // tuned for): wide, flattened caps that merge into a smooth sheet.
   const commonPointUniforms = {
     uRadius: { value: (sim.h ?? 0.3) * radiusScale },
+    uSpriteScale: { value: 2 },
     uProj11: { value: 1 },
-    uViewportH: { value: bufSize.height },
+    uViewportH: { value: HH },
   };
 
   // NB: do NOT declare modelViewMatrix/projectionMatrix in `uniforms`.
@@ -639,6 +677,8 @@ export function createScreenFluid(sim, renderer, scene, bounds, opts = {}) {
       uTexel: { value: new THREE.Vector2(1 / HW, 1 / HH) },
       uDir: { value: new THREE.Vector2(1, 0) },
       uSigmaR: { value: 0.11 },
+      uRecip: { value: 1 },
+      uRadiusPx: { value: 1 },          // set per-frame in update()
     },
     depthTest: false,
     depthWrite: false,
@@ -650,6 +690,7 @@ export function createScreenFluid(sim, renderer, scene, bounds, opts = {}) {
     uniforms: {
       uTex: { value: null },
       uTexel: { value: new THREE.Vector2(1 / HW, 1 / HH) },
+      uInvProj: { value: new THREE.Vector2(1, 1) },
     },
     depthTest: false,
     depthWrite: false,
@@ -666,6 +707,7 @@ export function createScreenFluid(sim, renderer, scene, bounds, opts = {}) {
       tThick: { value: rtThick.texture },
       uNear: { value: 0.1 },
       uFar: { value: 100 },
+      uInvProj: { value: new THREE.Vector2(1, 1) },
       uClearDist: { value: CLEAR_DIST },
       uLightDirVS: { value: new THREE.Vector3(0, 1, 0) },
       uDeepColor: { value: new THREE.Color(...deepColor) },
@@ -680,6 +722,7 @@ export function createScreenFluid(sim, renderer, scene, bounds, opts = {}) {
       uFresnel0: { value: 0.02 },
       uEdgeSoft: { value: 0.06 },
       uThickScale: { value: 0.12 },
+      uThinCut: { value: 0.35 },
       uDebugTint: { value: 0 },
       // --- flow-aware shading (B-R1) ---
       uFlowDirVS: { value: new THREE.Vector2(1, 0) },
@@ -732,24 +775,13 @@ export function createScreenFluid(sim, renderer, scene, bounds, opts = {}) {
   // orbit pivot: motion ≈ |Δpos| + angle(Δquat) * dist(camera→pivot).
   const CAM_JUMP_DIST = 0.75;                   // combined world-units; beyond → hard reset
   const _dbg = { pointsCalls: 0, pointsPoints: 0 }; // probe stats (see renderWater)
-  // Lane D — velocity-adaptive temporal alpha: 8 FIXED probe points spread
-  // across the smoothed-depth RT are sampled each update(); the mean
-  // absolute depth delta vs the previous frame estimates WATER motion
-  // (splashes move fast with zero camera input, which camera-motion gating
-  // cannot see). The delta is EMA-smoothed and mapped to an alpha
-  // multiplier: calm (<=0.02) → full alpha, fast (>=0.3) → alpha × 0.3.
-  // During update() rtSmoothHist always holds the LATEST pipeline output
-  // from last frame (the ping-pong swap puts the fresh write in hist).
-  const PROBE_N = 8;
-  const _probeUV = [
-    [0.20, 0.20], [0.50, 0.20], [0.80, 0.20], [0.35, 0.65],
-    [0.65, 0.35], [0.20, 0.80], [0.50, 0.50], [0.80, 0.80],
-  ];
-  const _probePrev = new Float32Array(PROBE_N); // last frame's samples
-  const _probePx = new Uint16Array(4);          // raw half-float bits (HalfFloat RT readback)
-  let _haveProbes = false;                      // prev samples valid?
-  let _waterMotionEMA = 0;                      // EMA of mean |Δdepth|
+  // Velocity-adaptive temporal alpha: fast water (splashes) must not blend
+  // much history or it ghosts. Water motion is estimated from the sim's own
+  // kinetic energy (rms particle speed) — this used to be 8 synchronous
+  // readRenderTargetPixels calls per frame, each a full GPU pipeline stall.
+  let _waterMotionEMA = 0;                      // EMA of rms speed (m/s)
   let _waterMotionMult = 1;                     // adaptive alpha multiplier
+  let _historyStale = false;                    // set on resize
 
   function blit(material, target) {
     quadMesh.material = material;
@@ -762,39 +794,33 @@ export function createScreenFluid(sim, renderer, scene, bounds, opts = {}) {
   }
 
   /* ---- per-frame prep ------------------------------------------------ */
-  // Sample the 8 fixed probes from the latest smoothed-depth RT and derive
-  // the velocity-adaptive alpha multiplier. Zero allocation: all buffers
-  // preallocated; failures (disposed RT / lost context) keep last value.
   function sampleWaterMotion() {
     if (!state.adaptiveTemporal) {
       _waterMotionEMA = 0;
       _waterMotionMult = 1;
       return;
     }
-    try {
-      const W = rtSmoothHist.width;
-      const H = rtSmoothHist.height;
-      let sum = 0;
-      let n = 0;
-      for (let i = 0; i < PROBE_N; i++) {
-        renderer.readRenderTargetPixels(rtSmoothHist,
-          (_probeUV[i][0] * (W - 1)) | 0,
-          ((1 - _probeUV[i][1]) * (H - 1)) | 0,
-          1, 1, _probePx);
-        const d = f16toF32(_probePx[0]);
-        // valid water depth only (0 sentinel / legacy clear-distance excluded)
-        const dValid = d > 0.02 && d < 9000;
-        const pValid = _haveProbes
-          && _probePrev[i] > 0.02 && _probePrev[i] < 9000;
-        if (dValid && pValid) { sum += Math.abs(d - _probePrev[i]); n++; }
-        _probePrev[i] = d;
-      }
-      _haveProbes = true;
-      if (n > 0) _waterMotionEMA += (sum / n - _waterMotionEMA) * 0.1;
-    } catch (_) { /* RT unreadable this frame — keep previous estimate */ }
-    // map motion -> multiplier: <=0.02 → 1.0 (full alpha), >=0.3 → 0.3×
-    const k = Math.min(1, Math.max(0, (_waterMotionEMA - 0.02) / 0.28));
+    const n = sim.count | 0;
+    const ke = sim.kineticEnergy;
+    if (n > 0 && Number.isFinite(ke)) {
+      _waterMotionEMA += (Math.sqrt(2 * ke / n) - _waterMotionEMA) * 0.1;
+    }
+    // map rms speed -> multiplier: <=0.5 m/s → 1.0 (full alpha), >=3 m/s → 0.3×
+    const k = Math.min(1, Math.max(0, (_waterMotionEMA - 0.5) / 2.5));
     _waterMotionMult = 1 - 0.7 * k * k * (3 - 2 * k);
+  }
+
+  /** Follow drawing-buffer resizes: internal RTs stay at resolutionScale. */
+  function syncSize() {
+    renderer.getDrawingBufferSize(_bufNow);
+    if (_bufNow.equals(bufSize)) return;
+    bufSize.copy(_bufNow);
+    HW = Math.max(4, Math.floor(bufSize.width * resolutionScale));
+    HH = Math.max(4, Math.floor(bufSize.height * resolutionScale));
+    for (const rt of [rtDepth, rtTemp, rtSmoothA, rtSmoothB, rtNormal, rtThick]) rt.setSize(HW, HH);
+    for (const m of [blurMat, normalMat, compMat]) m.uniforms.uTexel.value.set(1 / HW, 1 / HH);
+    compMat.uniforms.uAspect.value = Math.max(1e-3, bufSize.width / Math.max(1, bufSize.height));
+    _historyStale = true; // history RT was reallocated: skip one temporal blend
   }
 
   function update(camera) {
@@ -807,11 +833,19 @@ export function createScreenFluid(sim, renderer, scene, bounds, opts = {}) {
     // first updates this camera (scene.updateMatrixWorld). Early composite
     // calls (or a fresh camera swap) would otherwise throw
     // "Cannot read properties of null (reading 'elements')" every frame.
+    syncSize();
     const pm = camera.projectionMatrix;
     if (pm?.elements) {
-      commonPointUniforms.uProj11.value = pm.elements[5];
+      const e = pm.elements;
+      commonPointUniforms.uProj11.value = e[5];
+      normalMat.uniforms.uInvProj.value.set(1 / e[0], 1 / e[5]);
+      cu.uInvProj.value.set(1 / e[0], 1 / e[5]);
+      blurMat.uniforms.uSigmaR.value = state.blurSigma * commonPointUniforms.uRadius.value;
+      // sprite footprint radius in RT texels at view depth 1 m
+      blurMat.uniforms.uRadiusPx.value = commonPointUniforms.uRadius.value *
+        commonPointUniforms.uSpriteScale.value * e[5] * HH * 0.5;
     }
-    commonPointUniforms.uViewportH.value = bufSize.height;
+    commonPointUniforms.uViewportH.value = HH;
 
     // light direction -> view space (fall back to world dir until inverse exists)
     const m = camera.matrixWorldInverse ?? camera.matrixWorld;
@@ -943,18 +977,22 @@ export function createScreenFluid(sim, renderer, scene, bounds, opts = {}) {
         if (camera.quaternion) _camQuat.copy(camera.quaternion);
         _haveCamPose = true;
       }
-      // Lane D: velocity-adaptive factor from WATER motion (probe deltas).
+      // Velocity-adaptive factor from WATER motion (sim rms speed).
       // Composes with the camera-motion falloff above — a camera jump still
       // hard-resets to 0; fast splashes without camera input cut the blend.
       tAlpha *= _waterMotionMult;
-      blurMat.uniforms.uTemporalAlpha.value = tAlpha;
+      if (_historyStale) { tAlpha = 0; _historyStale = false; }
+      // H-pass reads the raw 1/z depth; no temporal blend (tPrev unbound
+      // and alpha 0 for this pass).
       blurMat.uniforms.uTex.value = rtDepth.texture;
-      // H-pass: tPrev unbound — the shader's validity guard (history must be
-      // 0.02..9000) falls back to the fresh sample, so this is a no-op blend.
+      blurMat.uniforms.uRecip.value = 1;
+      blurMat.uniforms.uTemporalAlpha.value = 0;
       blurMat.uniforms.tPrev.value = null;
       blurMat.uniforms.uDir.value.set(1, 0);
       blit(blurMat, rtTemp);
       blurMat.uniforms.uTex.value = rtTemp.texture;
+      blurMat.uniforms.uRecip.value = 0;
+      blurMat.uniforms.uTemporalAlpha.value = tAlpha;
       blurMat.uniforms.tPrev.value = rtSmoothHist.texture;
       blurMat.uniforms.uDir.value.set(0, 1);
       blit(blurMat, rtSmoothOut);
@@ -981,13 +1019,15 @@ export function createScreenFluid(sim, renderer, scene, bounds, opts = {}) {
     const f = gui.addFolder('Screen Fluid');
     f.add(state, 'enabled').name('enabled');
     f.add(commonPointUniforms.uRadius, 'value', 0.02, 0.5, 0.005).name('radius');
+    f.add(commonPointUniforms.uSpriteScale, 'value', 1, 3, 0.05).name('sprite scale');
     f.add(compMat.uniforms.uRefract, 'value', 0, 0.15, 0.005).name('refract');
     f.add(compMat.uniforms.uReflect, 'value', 0, 0.15, 0.005).name('reflect');
     f.add(compMat.uniforms.uSpecular, 'value', 0, 3, 0.05).name('specular');
     f.add(compMat.uniforms.uShininess, 'value', 8, 400, 1).name('shininess');
     f.add(compMat.uniforms.uEdgeSoft, 'value', 0.005, 0.5, 0.005).name('edge soft');
     f.add(compMat.uniforms.uThickScale, 'value', 0.01, 1, 0.01).name('thick scale');
-    f.add(blurMat.uniforms.uSigmaR, 'value', 0.005, 0.5, 0.005).name('blur sigma');
+    f.add(compMat.uniforms.uThinCut, 'value', 0, 2, 0.01).name('thin cutoff');
+    f.add(state, 'blurSigma', 0.1, 3, 0.05).name('blur sigma ×r');
     f.add(state, 'temporalAlpha', 0, 0.7, 0.01).name('temporal smooth');
     f.add(state, 'flowAngleDeg', 0, 360, 1).name('flow dir angle');
     f.add(compMat.uniforms.uFlowSpeed, 'value', 0, 4, 0.05).name('flow speed');
@@ -1048,11 +1088,11 @@ export function createScreenFluid(sim, renderer, scene, bounds, opts = {}) {
     const rawDepth = [];
     for (const [fx, fy] of [[0.5, 0.5], [0.45, 0.45], [0.55, 0.55], [0.02, 0.02]]) {
       r.readRenderTargetPixels(rtDepth, Math.floor(fx * (HWr - 1)), Math.floor((1 - fy) * (HHr - 1)), 1, 1, depthPx);
-      rawDepth.push(+depthPx[0].toFixed(2));
+      rawDepth.push(depthPx[0] > 0 ? +(1 / depthPx[0]).toFixed(2) : 0); // stored as 1/z
     }
     return {
       size: [HWr, HHr],
-      smoothDepth: samples,          // CLEAR_DIST=10000 means "no water written"
+      smoothDepth: samples,          // view depth z; 0 means "no water written"
       rawDepth,
       thicknessCenter: +thickPx[0].toFixed(4),
       drawRange: pointsGeo.drawRange.count,
@@ -1061,7 +1101,7 @@ export function createScreenFluid(sim, renderer, scene, bounds, opts = {}) {
       uProj11: commonPointUniforms.uProj11.value,
       uViewportH: commonPointUniforms.uViewportH.value,
       radius: commonPointUniforms.uRadius.value,
-      // Lane D adaptive-temporal diagnostics
+      // adaptive-temporal diagnostics (rms particle speed, m/s)
       waterMotionEMA: +_waterMotionEMA.toFixed(4),
       temporalMult: +_waterMotionMult.toFixed(3),
     };
@@ -1071,7 +1111,8 @@ export function createScreenFluid(sim, renderer, scene, bounds, opts = {}) {
   }
 
   return { state, update, renderWater, addGui, dispose, debugProbe,
-           get _compMat() { return compMat; } };
+           get _compMat() { return compMat; },
+           get _pointUniforms() { return commonPointUniforms; } };
 }
 
 export default createScreenFluid;

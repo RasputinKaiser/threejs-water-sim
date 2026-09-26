@@ -171,6 +171,7 @@ export class WaterSim {
     this.phaseMs = Object.fromEntries(PHASES.map((k) => [k, 0]));
     this.gridDim = GRID_DIM;
     this.kineticEnergy = 0;
+    this.drainedTotal = 0;
   }
 
   get particleCount() { return this.count; }
@@ -231,7 +232,7 @@ export class WaterSim {
   }
 
   // Drain: delete particles inside an axis-aligned region (e.g. a plughole).
-  // Returns the number removed.
+  // Returns the number removed; drainedTotal accumulates across calls.
   drain(region) {
     const before = this.count;
     const [x0, y0, z0] = region.min, [x1, y1, z1] = region.max;
@@ -239,7 +240,9 @@ export class WaterSim {
       const x = this.pos[i * 3], y = this.pos[i * 3 + 1], z = this.pos[i * 3 + 2];
       if (x >= x0 && x <= x1 && y >= y0 && y <= y1 && z >= z0 && z <= z1) this.removeParticle(i);
     }
-    return before - this.count;
+    const removed = before - this.count;
+    this.drainedTotal += removed;
+    return removed;
   }
 
   reset() { this.count = 0; this._gridValid = false; }

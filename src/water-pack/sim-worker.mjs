@@ -27,7 +27,8 @@
 //
 // Worker → main:
 //   {type:'ready', maxParticles}
-//   {type:'frame', frameId, count, simMs, leakedTotal, ke}   (simMs = worker-side step time)
+//   {type:'frame', frameId, count, simMs, leakedTotal, drainedTotal, ke}
+//                                                            (simMs = worker-side step time)
 //   {type:'debug', kind:'phases', batches, meanStepMs, perPhaseMs,
 //    pairsPerStep, dominant}                                 (every 30 batches)
 //
@@ -238,6 +239,7 @@ self.addEventListener('message', (e) => {
       post({
         type: 'frame', frameId, count: sim.count, simMs,
         leakedTotal: sim.leakedTotal ?? 0,
+        drainedTotal: sim.drainedTotal ?? 0,
         ke: sim.kineticEnergy ?? 0,
       });
       break;

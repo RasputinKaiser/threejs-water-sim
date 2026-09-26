@@ -10,7 +10,8 @@
 //   vmax, leaked fastest particle, particles lost through the bounds
 //
 // Run: node tools/creek-bench.mjs [--seconds 30] [--spacing 0.15] [--threads 0]
-//                                  [--solver dfsph|pbf] [--every 2]
+//                                  [--solver dfsph|pbf] [--every 2] [--prefill 1]
+// --prefill 1 (default) starts from the lab's pre-filled channel; 0 starts dry.
 
 import { availableParallelism } from 'node:os';
 import { createWater } from '../src/water/index.js';
@@ -27,6 +28,7 @@ const SPACING = Number(arg('--spacing', 0.15));
 const THREADS = Number(arg('--threads', 0));
 const EVERY = Number(arg('--every', 2));
 const SOLVER = arg('--solver', undefined);
+const PREFILL = arg('--prefill', '1') !== '0';
 const DT = 1 / 60;
 
 const water = await createWater({
@@ -41,6 +43,7 @@ water.addHeightfield(creek.heightfieldDesc(creek.buildHeights()));
 for (const b of creek.boulderSpheres()) water.addCollider({ type: 'sphere', position: b.center, radius: b.radius });
 const src = water.addSource(creek.inlet());
 water.addDrain(creek.OUTLET);
+if (PREFILL) water.spawn(creek.channelFill(SPACING));
 const sim = water.sim;
 const s = water.params.spacing, vol = s * s * s;
 
@@ -92,5 +95,10 @@ for (let f = 1; t < SECONDS - 1e-9; f++) {
     msSum = 0; msN = 0;
   }
   void n0; void spawned;
+}
+if (sim.mode === 'inline') {
+  const { phaseMs: ms, phaseNames: names } = sim.solver, parts = [];
+  for (const [k, name] of Object.entries(names)) if (name !== 'total' && ms[k] > 0.005) parts.push(`${name} ${ms[k].toFixed(2)}`);
+  console.log(`phases (ms, last step): ${parts.join(' · ')}`);
 }
 water.dispose();

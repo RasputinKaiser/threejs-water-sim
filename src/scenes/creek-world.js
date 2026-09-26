@@ -3,16 +3,19 @@
 // benchmark (tools/creek-bench.mjs). Pure math, no three.js.
 //
 // A 40 × 24 m heightfield with a meandering parabolic channel (3.2 m wide,
-// 0.9 m deep) on a 2% grade. Water enters through a submerged inlet at the
-// upstream end, runs the meander past boulders and leaves through an outflow
-// region at the downstream end.
+// 0.9 m deep) on a 2% grade, with riffles (bed bumps). Water enters through a
+// submerged inlet at the upstream end, runs the meander past boulders and
+// leaves through an outflow region at the downstream end.
 
 export const NX = 161, NZ = 97, SIZE_X = 40, SIZE_Z = 24;
 export const DX = SIZE_X / (NX - 1), DZ = SIZE_Z / (NZ - 1); // 0.25 m
 
-// meander centerline: two sinusoids → 2-3 graceful bends across 40 m
-const A1 = 2.5, F1 = 0.28;
-const A2 = 1.2, F2 = 0.71, PH2 = 1.3;
+// meander centerline: two sinusoids → 2-3 bends across 40 m. The tightest
+// bend radius is 3.9 m (1.2 channel widths; natural streams run 2-3): much
+// tighter and the water piles into the outer banks, losing its head at every
+// bend, and the creek turns into a chain of ponds.
+const A1 = 2.6, F1 = 0.2;
+const A2 = 0.9, F2 = 0.42, PH2 = 1.0;
 export const channelZ = (x) => A1 * Math.sin(x * F1) + A2 * Math.sin(x * F2 + PH2);
 export const channelDz = (x) => A1 * F1 * Math.cos(x * F1) + A2 * F2 * Math.cos(x * F2 + PH2);
 
@@ -114,3 +117,21 @@ export const OUTLET = { min: [16.5, -4, -12], max: [21, 5, 12] };
 
 /* gauge stations along the channel centreline (depth / speed measurement) */
 export const STATIONS = [-12, -4, 4, 12];
+
+/**
+ * The channel pre-filled: a sloped surface `above` m over the bed, moving
+ * down-creek at `speed`, on the solver lattice (spacing s) — the creek runs
+ * from the first frame. Returns [[x, y, z, vx, vy, vz], …] for water.spawn.
+ */
+export function channelFill(s, { above = 0.45, speed = 0.8 } = {}) {
+  const out = [];
+  for (let x = INLET_X + 0.5; x < OUTLET.min[0] - 0.3; x += s) {
+    const cz = channelZ(x), top = bedY(x) + above;
+    const tx = 1, tz = channelDz(x), tl = Math.hypot(tx, tz);
+    for (let z = cz - HALF_W; z <= cz + HALF_W; z += s) {
+      const g = groundH(x, z);
+      for (let y = g + 0.5 * s; y <= top; y += s) out.push([x, y, z, speed * tx / tl, 0, speed * tz / tl]);
+    }
+  }
+  return out;
+}

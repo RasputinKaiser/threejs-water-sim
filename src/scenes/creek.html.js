@@ -201,20 +201,8 @@ water.addHeightfield(creek.heightfieldDesc(heights));
 const inlet = water.addSource(creek.inlet());
 const outlet = water.addDrain(creek.OUTLET);
 
-// start with water in the channel: a sloped surface 0.45 m above the bed,
-// already moving down-creek, so the creek runs from the first frame
-function fillChannel() {
-  const s = water.params.spacing, out = [];
-  for (let x = creek.INLET_X + 0.5; x < creek.OUTLET.min[0] - 0.3; x += s) {
-    const cz = creek.channelZ(x), top = creek.bedY(x) + 0.45;
-    const t = [1, creek.channelDz(x)], tl = Math.hypot(t[0], t[1]);
-    for (let z = cz - creek.HALF_W; z <= cz + creek.HALF_W; z += s) {
-      const g = creek.groundH(x, z);
-      for (let y = g + 0.5 * s; y <= top; y += s) out.push([x, y, z, 0.8 * t[0] / tl, 0, 0.8 * t[1] / tl]);
-    }
-  }
-  return water.spawn(out);
-}
+// start with water in the channel, already moving down-creek
+const fillChannel = () => water.spawn(creek.channelFill(water.params.spacing));
 fillChannel();
 
 /* --------------------------------- UI --------------------------------- */

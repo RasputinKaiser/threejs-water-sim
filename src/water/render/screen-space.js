@@ -84,9 +84,11 @@ uniform float uSigmaR;     // depth range sigma (m)
 uniform float uRecip;      // 1: input holds 1/z
 uniform float uRadiusPx;   // footprint radius in texels at z = 1 m
 varying vec2 vUv;
+// depth in metres, 0 where there is no water (or the texel is not finite)
 float readZ(vec2 uv) {
   float v = texture2D(uTex, uv).r;
-  return uRecip > 0.5 ? (v > 0.0 ? 1.0 / v : 0.0) : v;
+  if (uRecip > 0.5) return v > 1e-4 ? 1.0 / v : 0.0;
+  return (v > 0.0 && v < 1e4) ? v : 0.0;
 }
 void main() {
   float d0 = readZ(vUv);
@@ -189,8 +191,8 @@ float sceneDepth(vec2 uv) {
 
 void tapWater(vec2 uv, float w, inout float z, inout vec3 n, inout float cov) {
   float d = texture2D(tDepth, uv).r;
-  float k = d > 0.0 ? w : 0.0;
-  z += d * k; n += texture2D(tNormal, uv).xyz * k; cov += k;
+  // accumulate valid texels only (NaN · 0 would still poison the sum)
+  if (d > 0.0 && d < 1e4) { z += d * w; n += texture2D(tNormal, uv).xyz * w; cov += w; }
 }
 
 vec3 environment(vec3 dirWorld) {
@@ -233,8 +235,10 @@ void main() {
     below = mix(below, uScatterColor, (1.0 - (T.r + T.g + T.b) / 3.0) * uScatter);
     float cosT = clamp(dot(n, V), 0.0, 1.0);
     float fres = uF0 + (1.0 - uF0) * pow(1.0 - cosT, 5.0);
-    vec3 R = uViewToWorld * reflect(-V, n);
-    vec3 refl = environment(normalize(R));
+    vec3 R = normalize(uViewToWorld * reflect(-V, n));
+    // near and below the horizon a reflected ray would hit the banks, not
+    // the sky (whose filtered lower hemisphere is black): use the scene
+    vec3 refl = mix(scene, environment(R), smoothstep(-0.05, 0.25, R.y));
     vec3 H = normalize(uSunDirView + V);
     float shin = 2.0 / max(uRoughness * uRoughness, 1e-4) - 2.0;
     float spec = pow(max(dot(n, H), 0.0), shin) * (shin + 8.0) / 25.13;
@@ -244,6 +248,7 @@ void main() {
     float solid = smoothstep(0.0, uThinCut, thickRaw);
     float a = occl * edge * solid * smoothstep(0.02, 0.5, cov);
     color = mix(scene, water, a);
+    if (any(isnan(color))) color = scene; // never a black texel
 #if DEBUG_VIEW == 1
     color = vec3(fract(wz), fract(wz * 10.0), 0.0);
 #elif DEBUG_VIEW == 2
@@ -252,6 +257,15 @@ void main() {
     color = vec3(thickRaw, L, 0.0);
 #elif DEBUG_VIEW == 4
     color = vec3(cov, a, occl);
+#elif DEBUG_VIEW == 5
+    // NaN finder: red water depth, green path length / thickness, blue scene
+    // depth, white scene colour, magenta scene Inf, yellow shading NaN/Inf;
+    // grey where all are finite
+    color = vec3(isnan(wz) ? 1.0 : 0.0, (isnan(L) || isnan(thickRaw)) ? 1.0 : 0.0, isnan(sd) ? 1.0 : 0.0);
+    if (any(isnan(scene))) color = vec3(1.0);
+    if (any(isinf(scene))) color = vec3(1.0, 0.0, 1.0);
+    if (any(isinf(water)) || any(isnan(water))) color = vec3(1.0, 1.0, 0.0);
+    if (color == vec3(0.0)) color = vec3(0.15);
 #endif
   }
 #if DEBUG_VIEW > 0
@@ -333,6 +347,9 @@ void main() {
 
 /* ------------------------------ renderer ------------------------------ */
 
+// per-type look values (spray, foam, bubble) accept one number for all three
+const vec3Of = (v) => (typeof v === 'number' ? [v, v, v] : v);
+
 const DEFAULT_LOOK = {
   resolution: 0.5,
   footprintScale: 2.0,       // sprite footprint = footprintScale × particle radius
@@ -375,11 +392,15 @@ export function createScreenSpaceRenderer({ renderer, particleRadius, spacing, c
     minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
     depthBuffer: false, stencilBuffer: false, generateMipmaps: false,
   };
-  const rtDepth = new THREE.WebGLRenderTarget(1, 1, halfOpts);
+  // depth chain: every read is texel-exact (the composite upsamples by hand,
+  // weighting valid texels only). Linear filtering would blend a surface with
+  // an empty texel into a tiny 1/z whose reciprocal overflows — NaN downstream.
+  const depthOpts = { ...halfOpts, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter };
+  const rtDepth = new THREE.WebGLRenderTarget(1, 1, depthOpts);
   const rtThick = new THREE.WebGLRenderTarget(1, 1, halfOpts);
-  const rtTemp = new THREE.WebGLRenderTarget(1, 1, halfOpts);
-  let rtSmooth = new THREE.WebGLRenderTarget(1, 1, halfOpts);
-  let rtHist = new THREE.WebGLRenderTarget(1, 1, halfOpts);
+  const rtTemp = new THREE.WebGLRenderTarget(1, 1, depthOpts);
+  let rtSmooth = new THREE.WebGLRenderTarget(1, 1, depthOpts);
+  let rtHist = new THREE.WebGLRenderTarget(1, 1, depthOpts);
   const rtNormal = new THREE.WebGLRenderTarget(1, 1, halfOpts);
   // full-resolution linear HDR scene colour + depth
   const sceneRT = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, depthBuffer: true, samples: 0 });
@@ -445,7 +466,7 @@ export function createScreenSpaceRenderer({ renderer, particleRadius, spacing, c
     },
   });
   compMat.toneMapped = true;
-  // look.debugView: 0 shaded, 1 water depth, 2 normals, 3 thickness, 4 coverage
+  // look.debugView: 0 shaded, 1 water depth, 2 normals, 3 thickness, 4 coverage, 5 NaN finder
   compMat.defines.DEBUG_VIEW = L.debugView ?? 0;
 
   // whitewater points: bubbles into the scene target (seen through the water),
@@ -459,8 +480,8 @@ export function createScreenSpaceRenderer({ renderer, particleRadius, spacing, c
   wwGeo.setDrawRange(0, 0);
   const wwUniforms = (pass, manual) => ({
     uProj11: pointUniforms.uProj11, uViewportH: { value: 1 },
-    uSize: { value: new THREE.Vector3(...L.foamSize).multiplyScalar(spacing) },
-    uOpacity: { value: new THREE.Vector3(...L.foamOpacity) },
+    uSize: { value: new THREE.Vector3(...vec3Of(L.foamSize)).multiplyScalar(spacing) },
+    uOpacity: { value: new THREE.Vector3(...vec3Of(L.foamOpacity)) },
     uPass: { value: pass }, uManualDepth: { value: manual },
     tSceneDepth: { value: sceneRT.depthTexture }, tWaterDepth: { value: null },
     uScreen: { value: new THREE.Vector2(1, 1) }, uNear: { value: 0.1 }, uFar: { value: 1000 },
@@ -563,8 +584,8 @@ export function createScreenSpaceRenderer({ renderer, particleRadius, spacing, c
     u.uEdgeSoft.value = L.edgeSoft; u.uThinCut.value = L.thinCut;
     blurMat.uniforms.uSigmaR.value = L.blurSigma * particleRadius;
     for (const m of [bubblePoints.material, foamPoints.material]) {
-      m.uniforms.uSize.value.set(...L.foamSize).multiplyScalar(spacing);
-      m.uniforms.uOpacity.value.set(...L.foamOpacity);
+      m.uniforms.uSize.value.set(...vec3Of(L.foamSize)).multiplyScalar(spacing);
+      m.uniforms.uOpacity.value.set(...vec3Of(L.foamOpacity));
       m.uniforms.uColor.value.setRGB(...L.foamColor);
     }
     if ('debugView' in patch) { compMat.defines.DEBUG_VIEW = L.debugView; compMat.needsUpdate = true; }

@@ -52,7 +52,7 @@ A body of density ρ floats with about ρ/1000 of its volume submerged.
 | `water.addDrain({min, max})` | removes water entering the box every frame |
 | `water.surfaceHeight(x, z)` | water surface height near (x, z), `-Infinity` if dry |
 | `water.setParams(patch)` | `viscosity, vorticity, friction, densityTolerance, gravity, maxSpeed, bounds, …` |
-| `water.setLook(patch)` | `absorption, scatterColor, scatter, refraction, roughness, f0, envIntensity, foamSize, foamOpacity, …` |
+| `water.setLook(patch)` | `absorption, scatterColor, scatter, refraction, roughness, f0, envIntensity, foamSize, foamOpacity, …`; `debugView` 1–5 shows depth / normals / thickness / coverage / a NaN finder |
 | `water.stats` | `stepMs, threads, avgDensityError, maxDensityError, pressureIterations, substeps, whitewater, kineticEnergy, leaked, drained, colliders` |
 
 Quality presets (`src/water/index.js`): `low` 15 cm spacing, 0.5% density
@@ -69,11 +69,14 @@ sort to the end), neighbour lists, warm-started pressure solves whose
 iteration count adapts to the density tolerance one frame late, the same SDF
 volume-map boundaries and bed drag, body impulses via fixed-point atomics.
 Positions are read back asynchronously (one frame, like the worker path) for
-the WebGL renderer and the Box3D coupling. Whitewater is CPU-only for now.
-`npm run gpu-check` (with the dev server running and `PLAYWRIGHT` pointing at
-a Playwright install) compares it with the CPU solver in headless Chromium:
-resting column 0.582 m mean height on both, 0.19% mean density error on both;
-buoyancy on a fixed sphere 1.057× (GPU) vs 1.065× (CPU) ρgV.
+the WebGL renderer and the Box3D coupling. Whitewater runs on the GPU too
+(emission, classification and advection as compute passes, survivors
+compacted each step). `npm run gpu-check` (with the dev server running and
+`PLAYWRIGHT` pointing at a Playwright install) compares it with the CPU solver
+in headless Chromium: resting column 0.582 m mean height on both, 0.19% mean
+density error on both; buoyancy on a fixed sphere 1.05× (GPU) vs 1.065× (CPU)
+ρgV; a block plunging into a pool peaks at 477 / 1429 / 1005 spray / foam /
+bubble particles on the GPU vs 437 / 1464 / 985 on the CPU, none in still water.
 
 **Threads** need `SharedArrayBuffer`, i.e. the page must be served with
 `Cross-Origin-Opener-Policy: same-origin` and
@@ -96,6 +99,10 @@ Without them `createWater` silently falls back to the main thread.
   (Jᵀk), so it does no work on density-preserving motion. Particles are kept
   out of solids by a crossing-aware projection; spawns inside solids are dropped.
 - **Wall shear**: quadratic bed drag (`friction` = C_f), applied implicitly.
+  Checked against open-channel hydraulics (`test/open-channel.test.mjs`):
+  without drag, water on a slope S accelerates at exactly g·S (the solver
+  and the walls dissipate nothing); with drag it follows
+  u∞·tanh(t·gS/u∞), u∞ = √(gSR/C_f).
 - **Viscosity** (XSPH, per 1/60 s) and **vorticity confinement**.
 - **Whitewater** (Ihmsen et al. 2012): every fluid particle has a generation
   potential from trapped air (neighbours converging), wave crests (surface
@@ -119,8 +126,8 @@ Measured on the 4-core VM this was developed on:
 |---|---|---|
 | buoyancy on a fixed submerged sphere / box (spacing 0.1) | 1.05× / 1.02× ρgV | 1.26× / 1.10× |
 | same at spacing 0.05 | 0.96× / 0.93× | 0.77× / 0.71× |
-| mean density error, resting column / creek | 0.2% / 0.07% | ~3% |
-| creek, 6.3k particles + 1.3k diffuse, 1 thread | 29 ms/step (4.7 µs/particle) | — |
+| mean density error, resting column / creek | 0.2% / 0.08% | ~3% |
+| creek, 6.4k particles + whitewater, 1 / 3 threads | 28 / 13 ms/step | — |
 | dam break, 8k particles, 1 / 3 threads (`npm run bench`) | 65 / 28 ms/step | 41 / 19 ms/step |
 
 Cost scales linearly with particle count; a desktop CPU with more cores is
@@ -136,7 +143,7 @@ compression.
 | `bucket.html` | 1.2 m bucket at 5 cm spacing, spout fill, settling |
 | `pool.html` — Big Pool | 25 × 12.5 m pool, ~25k particles, waves |
 | `terrain.html` | heightfield valley, flow downhill into a basin |
-| `creek.html` — Creek | the main proving ground: a 40 m meander on a 2% grade (terrain and boulders in both Box3D and the solver), floating logs carried by the current, submerged inlet + outlet, whitewater, gauges for depth / speed / flow |
+| `creek.html` — Creek | the main proving ground: a 40 m pool-and-riffle meander on a 2% grade (terrain and boulders in both Box3D and the solver), floating logs carried by the current, submerged inlet + outlet, whitewater, gauges for depth / speed / flow. At steady state ~0.5 m³/s runs through: 0.6–1 m/s in the pools, 1.2–1.9 m/s over the riffles |
 | `water-lab.html` | the pack used without the debug harness, as a game would |
 
 URL params: `quality=low|medium|high`, `render=screen|points`, `backend=cpu|gpu`, `pour`.
@@ -154,10 +161,10 @@ Agent-driven runs: `node tools/shot-server.mjs`, then open a lab with
 
 ## Tests & tools
 ```
-npm test           # node:test suites: DFSPH + PBF cores, threads, Box3D buoyancy and drag, whitewater, createWater
+npm test           # node:test suites: DFSPH + PBF cores, threads, Box3D buoyancy and drag, open-channel flow, whitewater, createWater
 npm run fuzz       # adversarial fuzz (NaN injection, teleports, overlap, param chaos, …)
 npm run bench      # ms/step + per-phase split, single-threaded vs threaded (--solver dfsph|pbf)
-node tools/creek-bench.mjs   # the Creek headless: inflow/outflow, gauges, density error, cost
+node tools/creek-bench.mjs   # the Creek headless (pre-filled channel): inflow/outflow, gauges, density error, cost, phase split
 ```
 CI (`.github/workflows/ci.yml`) runs the tests, a shortened fuzz pass and the build.
 

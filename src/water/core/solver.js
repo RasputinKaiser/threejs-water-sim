@@ -28,6 +28,10 @@ import {
 
 export const MAX_COLLIDER_CANDIDATES = 4;
 
+// Start-of-step overlap (fraction of the contact radius) resolved by the
+// ordinary contact response; deeper overlaps are removed without velocity.
+const DEPEN_SLOP = 0.25;
+
 // Header (Int32) slots shared between threads.
 export const H = {
   count: 0, colliders: 1, overflow: 2, removed: 3, nextId: 4, tableMask: 5,
@@ -180,6 +184,7 @@ export class PBFSolver {
     if (n >= this.N) return false;
     if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z) &&
           Number.isFinite(vx) && Number.isFinite(vy) && Number.isFinite(vz))) return false;
+    if (this.insideSolid(x, y, z)) return false;
     const i3 = n * 3;
     this.pos[i3] = x; this.pos[i3 + 1] = y; this.pos[i3 + 2] = z;
     this.prev[i3] = x; this.prev[i3 + 1] = y; this.prev[i3 + 2] = z;
@@ -189,6 +194,13 @@ export class PBFSolver {
     this.nbrCount[n] = 0;
     this.header[H.count] = n + 1;
     return true;
+  }
+
+  /** Is (x,y,z) strictly inside any collider? Spawns there are discarded. */
+  insideSolid(x, y, z) {
+    const rec = this.colliders, hf = this.heightfields, nc = this.header[H.colliders];
+    for (let c = 0; c < nc; c++) if (colliderSDF(rec, c, hf, x, y, z, this._n) < 0) return true;
+    return false;
   }
 
   /** Swap-remove particle i (order is rebuilt by the next sort anyway). */
@@ -422,8 +434,11 @@ export class PBFSolver {
         for (let k = 0; k < K; k++) {
           const c = cand[cb + k];
           if (c < 0) break;
-          const d = colliderSDF(rec, c, hf, xi, yi, zi, n);
+          let d = colliderSDF(rec, c, hf, xi, yi, zi, n);
           if (d >= h) continue;
+          // a particle inside a solid is the collision phase's to resolve:
+          // counted as if on the surface, it cannot blow up the pressure
+          if (d < 0) d = 0;
           rho += rho0 * wallFraction(d, h);
           const s = wallFractionSlope(d, h); // ∂(ρ/ρ0)/∂d
           gx += s * n[0]; gy += s * n[1]; gz += s * n[2];
@@ -470,8 +485,9 @@ export class PBFSolver {
         for (let k = 0; k < K; k++) {
           const c = cand[cb + k];
           if (c < 0) break;
-          const d = colliderSDF(rec, c, hf, xi, yi, zi, n);
+          let d = colliderSDF(rec, c, hf, xi, yi, zi, n);
           if (d >= h) continue;
+          if (d < 0) d = 0; // as in phaseLambda
           const o = c * COLLIDER_STRIDE;
           const s = li * wallFractionSlope(d, h) * rec[o + F.alpha]; // λ_i ∂C/∂d along n
           const wx = s * n[0], wy = s * n[1], wz = s * n[2];
@@ -498,7 +514,7 @@ export class PBFSolver {
     const rec = this.colliders, hf = this.heightfields, cand = this.cand, n = this._n;
     const K = MAX_COLLIDER_CANDIDATES;
     const imp = this.impulses, impBase = tid * this.maxColliders * 6;
-    const mOverDt = dp.particleMass / this.u[U.dt];
+    const dt = this.u[U.dt], mOverDt = dp.particleMass / dt;
     const w = this.u[U.omega];
     for (let i = i0; i < i1; i++) {
       const i3 = i * 3;
@@ -529,9 +545,29 @@ export class PBFSolver {
         const pen = target - d;
         const mx = sx + pen * n[0] - x, my = sy + pen * n[1] - y, mz = sz + pen * n[2] - z;
         x += mx; y += my; z += mz;
+        // Depenetration is not a collision: the part of the push that only
+        // undoes an overlap the particle already had at the start of the step
+        // (spawned into a solid or its skin, a body created or teleported
+        // into water) moves the step origin along, so it adds no velocity and
+        // no reaction impulse. The start overlap is measured along this
+        // contact's normal relative to the collider surface, which moved by
+        // v·dt during the step — so a paddle sweeping into water still pushes
+        // it. Like Box2D's linear slop, overlaps under `slop` keep the
+        // ordinary response: where walls meet, particles end each step
+        // slightly inside one wall's skin, and that response keeps them at rest.
+        let sh = 0;
+        if (pen > 0) {
+          colliderVelocity(rec, c, x, y, z, m);
+          const below = (x - pr[i3] - m[0] * dt) * n[0] + (y - pr[i3 + 1] - m[1] * dt) * n[1] +
+            (z - pr[i3 + 2] - m[2] * dt) * n[2] - DEPEN_SLOP * rad;
+          sh = below < pen ? below : pen;
+          if (sh > 0) {
+            pr[i3] += sh * n[0]; pr[i3 + 1] += sh * n[1]; pr[i3 + 2] += sh * n[2];
+          } else sh = 0;
+        }
         if (rec[o + F.flags] & FLAG_DYNAMIC) {
           addImpulse(imp, impBase + rec[o + F.slot] * 6, rec, o, x, y, z,
-            -mx * mOverDt, -my * mOverDt, -mz * mOverDt);
+            -(mx - sh * n[0]) * mOverDt, -(my - sh * n[1]) * mOverDt, -(mz - sh * n[2]) * mOverDt);
         }
       }
       p[i3] = x; p[i3 + 1] = y; p[i3 + 2] = z;

@@ -114,6 +114,52 @@ test('no particle ends up inside a solid (box, rotated box, sphere, capsule)', (
   }
 });
 
+test('water spawned into solids is discarded; overlaps resolve without launching it', () => {
+  // no gravity: water at rest density stays put unless overlap resolution kicks it
+  const s = new PBFSolver({ spacing: 0.1, maxParticles: 4000, gravity: [0, 0, 0] });
+  const cols = [
+    { type: 'plane', position: [0, 0, 0] },
+    { type: 'box', position: [0, 0.3, 0], size: [0.3, 0.3, 0.3] },
+  ];
+  setColliders(s, cols);
+  // a block straddling the box, plus a sheet 5 mm above the floor (inside the contact skin)
+  block(s, [-0.6, 0, -0.6], [0.6, 0.8, 0.6]);
+  const n = new Float64Array(3);
+  for (let i = 0; i < s.count; i++) {
+    const d = colliderSDF(s.colliders, 1, s.heightfields, s.pos[i * 3], s.pos[i * 3 + 1], s.pos[i * 3 + 2], n);
+    assert.ok(d >= 0, `spawned ${(-d).toFixed(3)} m inside the box`);
+  }
+  for (let x = -0.95; x < 0.95; x += 0.1) for (let z = -0.95; z < 0.95; z += 0.1) {
+    if (Math.max(Math.abs(x), Math.abs(z)) > 0.65) s.addParticle(x, 0.005, z);
+  }
+  let vmax = 0;
+  for (let f = 0; f < 30; f++) {
+    s.step(DT);
+    for (let i = 0; i < s.count; i++) vmax = Math.max(vmax, Math.hypot(s.vel[i * 3], s.vel[i * 3 + 1], s.vel[i * 3 + 2]));
+  }
+  // pushing the sheet out of the skin as a collision would give Δx/dt ≈ 2.7 m/s;
+  // depenetration leaves at most slop/dt (0.75 m/s) for the contact response
+  assert.ok(vmax < 1, `max speed ${vmax.toFixed(2)} m/s`);
+});
+
+test('a body created inside water pushes it aside without an explosion', () => {
+  const s = new PBFSolver({ spacing: 0.1, maxParticles: 4000, gravity: [0, 0, 0] });
+  block(s, [-0.6, 0, -0.6], [0.6, 1, 0.6]);
+  // the sphere appears after the fill (no spawn filtering), moving down at 1 m/s
+  setColliders(s, [
+    { type: 'plane', position: [0, 0, 0] },
+    { type: 'sphere', position: [0, 0.5, 0], radius: 0.2, velocity: [0, -1, 0], dynamic: true, slot: 0, mass: 50 },
+  ]);
+  let vmax = 0;
+  for (let f = 0; f < 10; f++) {
+    s.step(DT);
+    for (let i = 0; i < s.count; i++) vmax = Math.max(vmax, Math.hypot(s.vel[i * 3], s.vel[i * 3 + 1], s.vel[i * 3 + 2]));
+  }
+  // its 34 L of displaced water must flow aside (≈ 3.4 m/s here); resolving the
+  // overlap as a collision and as wall pressure threw particles at ~9 m/s
+  assert.ok(vmax < 5, `max speed ${vmax.toFixed(2)} m/s`);
+});
+
 test('rotated box SDF: distance and normal agree with sampling', () => {
   const rec = new Float32Array(24);
   writeCollider(rec, 0, { type: 'box', position: [1, 2, 3], size: [0.5, 0.2, 0.3], rotation: [0.1, 0.3, 0.2, 0.9273618] });

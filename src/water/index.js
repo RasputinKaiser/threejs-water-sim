@@ -59,6 +59,12 @@ export async function createWater({
   const dp = sim.params;
   let staticColliders = [...colliders];
   let collidersDirty = true;
+  // colliders take effect immediately (spawns right after addCollider already
+  // see them); with Box3D the coupling rebuilds the list every update
+  function syncColliders() {
+    if (coupling) coupling.setColliders(staticColliders);
+    else { sim.setColliders(staticColliders); collidersDirty = false; }
+  }
   const coupling = b3 && world ? createBox3DCoupling({ sim, b3, world, colliders: staticColliders }) : null;
 
   // ---- rendering ---------------------------------------------------------
@@ -157,14 +163,12 @@ export async function createWater({
     /** Static solver collider (plane, box, sphere, capsule, container, heightfield). */
     addCollider(desc) {
       staticColliders.push(desc);
-      collidersDirty = true;
-      coupling?.setColliders(staticColliders);
+      syncColliders();
       return desc;
     },
     removeCollider(desc) {
       staticColliders = staticColliders.filter((c) => c !== desc);
-      collidersDirty = true;
-      coupling?.setColliders(staticColliders);
+      syncColliders();
     },
     /** Register terrain; returns a collider you can pass to addCollider. */
     addHeightfield({ minX, minZ, dx, dz, nx, nz, heights, friction }) {

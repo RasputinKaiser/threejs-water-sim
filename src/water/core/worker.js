@@ -111,19 +111,19 @@ function coordinator(msg) {
         [impulses.buffer, contacts.buffer]);
       break;
     }
+    // Commands take effect in the next published frame: publishing only once
+    // per step batch keeps the double buffer safe (the main thread reads the
+    // latest half synchronously and only then posts the next batch).
     case 'spawn': {
       const d = msg.data;
       for (let k = 0; k + 5 < d.length; k += 6) solver.addParticle(d[k], d[k + 1], d[k + 2], d[k + 3], d[k + 4], d[k + 5]);
-      publish(Atomics.load(pub.header, 3));
       break;
     }
     case 'removeBox':
       solver.removeInBox(msg.min, msg.max);
-      publish(Atomics.load(pub.header, 3));
       break;
     case 'reset':
       solver.header[H.count] = 0;
-      publish(Atomics.load(pub.header, 3));
       break;
     case 'params':
       solver.setUniforms(msg.patch);

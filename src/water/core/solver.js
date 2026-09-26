@@ -743,6 +743,32 @@ export class PBFSolver {
     con.fill(0);
   }
 
+  // Moving colliders (kinematic/dynamic bodies) are advanced along their
+  // linear + angular velocity by dt before each step, so across a batch of k
+  // steps a collider sweeps to where the rigid-body engine will have moved it
+  // instead of staying frozen and then jumping into the fluid next batch.
+  _advanceColliders(dt) {
+    const rec = this.colliders, nc = this.header[H.colliders];
+    for (let c = 0; c < nc; c++) {
+      const o = c * COLLIDER_STRIDE;
+      const vx = rec[o + F.vx], vy = rec[o + F.vy], vz = rec[o + F.vz];
+      const wx = rec[o + F.wx], wy = rec[o + F.wy], wz = rec[o + F.wz];
+      if (vx === 0 && vy === 0 && vz === 0 && wx === 0 && wy === 0 && wz === 0) continue;
+      rec[o + F.px] += vx * dt; rec[o + F.py] += vy * dt; rec[o + F.pz] += vz * dt;
+      if (wx !== 0 || wy !== 0 || wz !== 0) {
+        // q ← normalize(q + ½·dt·(ω, 0)·q)
+        const qx = rec[o + F.qx], qy = rec[o + F.qy], qz = rec[o + F.qz], qw = rec[o + F.qw];
+        const h = 0.5 * dt;
+        let nx = qx + h * (wx * qw + wy * qz - wz * qy);
+        let ny = qy + h * (wy * qw + wz * qx - wx * qz);
+        let nz = qz + h * (wz * qw + wx * qy - wy * qx);
+        let nw = qw - h * (wx * qx + wy * qy + wz * qz);
+        const l = 1 / Math.sqrt(nx * nx + ny * ny + nz * nz + nw * nw);
+        rec[o + F.qx] = nx * l; rec[o + F.qy] = ny * l; rec[o + F.qz] = nz * l; rec[o + F.qw] = nw * l;
+      }
+    }
+  }
+
   /* ================= driver ================= */
 
   /** Run one parallel phase over particles [i0, i1) as thread `tid`. */
@@ -777,6 +803,7 @@ export class PBFSolver {
     this.header[H.overflow] = 0;
     const exec = parallel ?? ((id) => this.runPhase(id, 0, this.header[H.count], 0));
     const run = (id) => { const t = performance.now(); exec(id); T[id] += performance.now() - t; };
+    this._advanceColliders(dt);
     if (this.header[H.count] > 0) {
       run(PHASE.predict);
       let t = performance.now();

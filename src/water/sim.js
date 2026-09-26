@@ -140,6 +140,7 @@ function createInline(dp, opts) {
   const sim = {
     mode: 'inline',
     maxColliders: base.maxColliders,
+    fixedDt: base.fixedDt,
     threads: 0,
     ready: Promise.resolve(),
     solver,
@@ -221,9 +222,18 @@ async function createThreaded(dp, K, opts) {
     pos: new Float32Array(pubBuf.pos), prev: new Float32Array(pubBuf.prev),
     vel: new Float32Array(pubBuf.vel), nbr: new Int32Array(pubBuf.nbr), id: new Int32Array(pubBuf.id),
   };
+  // The active half is LATCHED once per update(): count and every array view
+  // then come from the same published frame even if the worker flips halves
+  // meanwhile (reading them through separate Atomics loads raced with the
+  // flip and mixed a new count with the other half's stale positions).
+  let latched = 0, latchedCount = 0;
+  function latch() {
+    latched = Atomics.load(pub.header, 0);
+    latchedCount = Atomics.load(pub.header, 1 + latched);
+  }
   const view = (arr, stride) => {
     const cache = [arr.subarray(0, N * stride), arr.subarray(N * stride, 2 * N * stride)];
-    return () => cache[Atomics.load(pub.header, 0)];
+    return () => cache[latched];
   };
   const curPos = view(pub.pos, 3), curPrev = view(pub.prev, 3), curVel = view(pub.vel, 3);
   const curNbr = view(pub.nbr, 1), curId = view(pub.id, 1);
@@ -254,6 +264,7 @@ async function createThreaded(dp, K, opts) {
       if (m.type === 'ready') resolve();
       else if (m.type === 'frame') {
         busy = false;
+        latch();
         lastStats = m.stats;
         lastMs = m.ms;
         const steps = inflightSteps.shift() ?? 0;
@@ -296,10 +307,11 @@ async function createThreaded(dp, K, opts) {
   const sim = {
     mode: 'threaded',
     maxColliders: base.maxColliders,
+    fixedDt: base.fixedDt,
     threads: K,
     ready,
     get params() { return dp; },
-    get count() { return Atomics.load(pub.header, 1 + Atomics.load(pub.header, 0)); },
+    get count() { return latchedCount; },
     get positions() { return curPos(); },
     get prevPositions() { return curPrev(); },
     get velocities() { return curVel(); },

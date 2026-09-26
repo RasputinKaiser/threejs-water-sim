@@ -22,6 +22,7 @@
 
 import { H, solverStats } from './fluid-core.js';
 import { createSolver } from './create-solver.js';
+import { packWhitewater } from './whitewater.js';
 import { COLLIDER_STRIDE } from './colliders.js';
 import { CTL, OP_YIELD, OP_QUIT, makeParallel, broadcast, waitResumed, helperLoop } from './threads.js';
 
@@ -75,6 +76,8 @@ function publish(frameId) {
   pub.vel.set(solver.vel.subarray(0, n * 3), o3);
   pub.nbr.set(solver.nbrCount.subarray(0, n), o1);
   pub.id.set(solver.id.subarray(0, n), o1);
+  const m = pub.D ? packWhitewater(solver.diffuse, solver.header[H.diffuse], pub.diffuse.subarray(active * pub.D * 4)) : 0;
+  Atomics.store(pub.header, 4 + active, m);
   Atomics.store(pub.header, 1 + active, n);
   Atomics.store(pub.header, 0, active);
   Atomics.store(pub.header, 3, frameId);
@@ -152,6 +155,7 @@ self.addEventListener('message', (e) => {
         header: new Int32Array(msg.pub.header),
         pos: new Float32Array(msg.pub.pos), prev: new Float32Array(msg.pub.prev),
         vel: new Float32Array(msg.pub.vel), nbr: new Int32Array(msg.pub.nbr), id: new Int32Array(msg.pub.id),
+        diffuse: new Float32Array(msg.pub.diffuse), D: solver.D ?? 0,
       };
       waitResumed(ctl, K);
       postMessage({ type: 'ready' });

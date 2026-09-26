@@ -53,6 +53,18 @@ export const DEFAULTS = {
   maxOverdensity: 0.05,        // existing over-density removed per substep (ρ0 fraction)
   contactMin: 0.3,             // closest approach to a solid, in spacings (safety projection)
 
+  // --- whitewater (DFSPH): spray, foam, bubbles — see core/whitewater.js ---
+  maxDiffuse: 16384,           // 0 disables
+  wwTrappedAir: 25,            // k_ta: diffuse particles / s per fluid particle at full potential
+  wwWaveCrest: 40,             // k_wc
+  wwTrappedAirRange: [0.8, 4], // Φ ramp of I_ta (m/s)
+  wwCrestRange: [0.6, 2.5],    // Φ ramp of I_wc (m/s)
+  wwEnergy: [0.8, 6],          // Φ ramp of ½|v|² (J/kg)
+  wwLifetime: [1.5, 4],        // foam lifetime range (s)
+  wwBuoyancy: 2,               // bubble buoyancy (× gravity)
+  wwDrag: 0.5,                 // bubble drag toward the fluid velocity (per step share)
+  wwAirDrag: 0.2,              // spray air drag (1/s)
+
   // --- boundaries --------------------------------------------------------
   // wall friction. PBF: tangential slip damping per step on contact, 0..1.
   // DFSPH: the walls' quadratic drag coefficient C_f (τ = ρ C_f |u|u):
@@ -217,6 +229,11 @@ function deriveDFSPH(p, s, h) {
     // particles with fewer neighbors are at the free surface: they get no
     // divergence correction (Bender & Koschier: ~20 of a full 3D neighborhood)
     minNeighbors: Math.round(0.6 * neighbors),
+    wwSprayNeighbors: Math.round(0.25 * neighbors),
+    wwBubbleNeighbors: Math.round(0.75 * neighbors),
+    // |Σ∇W/ρ| of a particle on a flat free surface: the colour-field gradient
+    // that counts as fully "surface" for the wave-crest potential
+    wwSurfaceGrad: Math.abs(bnd.dF[Math.round(0.5 * s * bnd.inv)]),
     bndF: bnd.F, bndDF: bnd.dF, bndInv: bnd.inv, bndN: bnd.n,
     particleRadius: p.collisionRadius * s,
     dynamicRadius: p.dynamicCollisionRadius * s,

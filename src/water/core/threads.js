@@ -32,10 +32,12 @@ export function sliceOf(n, K, tid) {
   return [i0, Math.min(n, i0 + chunk)];
 }
 
-/** Coordinator side: returns a `parallel(id)` function for solver.step(). */
+/**
+ * Coordinator side: returns a `parallel(id, n?)` function for solver.step().
+ * `n` is the range to split (default: the particle count).
+ */
 export function makeParallel(solver, ctl, K) {
-  return function parallel(id) {
-    const n = solver.header[0];
+  return function parallel(id, n = solver.header[0]) {
     if (K <= 1 || n < MIN_PARALLEL) { solver.runPhase(id, 0, n, 0); return; }
     dispatch(ctl, K, id, n);
     const [i0, i1] = sliceOf(n, K, 0);

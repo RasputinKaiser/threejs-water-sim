@@ -147,7 +147,7 @@ harness.setHudProvider(() => {
   const flat = Number.isFinite(probeData.flatness) ? probeData.flatness.toFixed(3) : '—';
   const level = Number.isFinite(probeData.level) ? probeData.level.toFixed(2) : '—';
   return [
-    `<b>Pool Lab</b> — Box3D world + PBF water (hash grid)`,
+    `<b>Pool Lab</b> — Box3D world + particle water (hash grid)`,
     waterHudLine(harness, water),
     `bodies awake <b>${b3.b3World_GetAwakeBodyCount(world)}</b>  colliders <b>${water.stats.colliders ?? 0}</b>`,
     `pool: <b>${probeData.count}</b> particles  level <b>${level}</b> m`,

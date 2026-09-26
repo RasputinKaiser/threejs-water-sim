@@ -19,6 +19,7 @@
 import { deriveParams } from './core/params.js';
 import { allocateBuffers, solverStats, H } from './core/fluid-core.js';
 import { createSolver } from './core/create-solver.js';
+import { packWhitewater } from './core/whitewater.js';
 import { COLLIDER_STRIDE, writeCollider, packHeightfield } from './core/colliders.js';
 import { CTL_SIZE } from './core/threads.js';
 import { mulberry32 } from 'math/random';
@@ -121,6 +122,7 @@ function createInline(dp, opts) {
   const heightfields = [];
   const buffers = allocateBuffers(dp, { maxColliders: base.maxColliders });
   const solver = createSolver(dp, buffers, { heightfields });
+  const diffusePacked = new Float32Array((buffers.D || 0) * 4);
   const impulses = new Float64Array(base.maxColliders * 6);
   const scratch = new Float64Array(base.maxColliders * 6);
   let impulseTime = 0;
@@ -155,6 +157,11 @@ function createInline(dp, opts) {
     get alpha() { return base.alpha; },
     get stepMs() { return lastMs; },
     get stats() { return solverStats(solver); },
+    /** Whitewater: { count, data: [x y z type+alpha]* } (packed on each read). */
+    get diffuse() {
+      const m = solver.D ? solver.header[H.diffuse] : 0;
+      return { count: m ? packWhitewater(solver.diffuse, m, diffusePacked) : 0, data: diffusePacked };
+    },
     /**
      * Per-slot fluid impulses [Jx,Jy,Jz, Lx,Ly,Lz] (N·s, moments about the
      * collider origin) accumulated since the last read over `time` seconds,
@@ -210,24 +217,29 @@ async function createThreaded(dp, K, opts) {
   const N = dp.maxParticles;
   const ctl = sab(CTL_SIZE * 4);
   const staging = sab(base.maxColliders * COLLIDER_STRIDE * 4);
+  const D = buffers.D;
   const pubBuf = {
-    header: sab(16), pos: sab(2 * N * 3 * 4), prev: sab(2 * N * 3 * 4),
+    header: sab(32), pos: sab(2 * N * 3 * 4), prev: sab(2 * N * 3 * 4),
     vel: sab(2 * N * 3 * 4), nbr: sab(2 * N * 4), id: sab(2 * N * 4),
+    diffuse: sab(2 * D * 4 * 4), // whitewater, packed [x y z type+alpha]
   };
   const pub = {
     header: new Int32Array(pubBuf.header),
     pos: new Float32Array(pubBuf.pos), prev: new Float32Array(pubBuf.prev),
     vel: new Float32Array(pubBuf.vel), nbr: new Int32Array(pubBuf.nbr), id: new Int32Array(pubBuf.id),
+    diffuse: new Float32Array(pubBuf.diffuse),
   };
   // The active half is LATCHED once per update(): count and every array view
   // then come from the same published frame even if the worker flips halves
   // meanwhile (reading them through separate Atomics loads raced with the
   // flip and mixed a new count with the other half's stale positions).
-  let latched = 0, latchedCount = 0;
+  let latched = 0, latchedCount = 0, latchedDiffuse = 0;
   function latch() {
     latched = Atomics.load(pub.header, 0);
     latchedCount = Atomics.load(pub.header, 1 + latched);
+    latchedDiffuse = Atomics.load(pub.header, 4 + latched);
   }
+  const diffuseHalves = [pub.diffuse.subarray(0, D * 4), pub.diffuse.subarray(D * 4, 2 * D * 4)];
   const view = (arr, stride) => {
     const cache = [arr.subarray(0, N * stride), arr.subarray(N * stride, 2 * N * stride)];
     return () => cache[latched];
@@ -317,6 +329,8 @@ async function createThreaded(dp, K, opts) {
     get alpha() { return base.alpha; },
     get stepMs() { return lastMs; },
     get stats() { return lastStats; },
+    /** Whitewater of the latest frame: { count, data: [x y z type+alpha]* }. */
+    get diffuse() { return { count: latchedDiffuse, data: diffuseHalves[latched] }; },
     get busy() { return busy; },
     takeImpulses() {
       const t = impulseTime; impulseTime = 0;

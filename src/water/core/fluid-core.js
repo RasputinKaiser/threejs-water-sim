@@ -18,7 +18,7 @@ export const BND_STRIDE = 8;
 // Header (Int32) slots shared between threads.
 export const H = {
   count: 0, colliders: 1, overflow: 2, removed: 3, nextId: 4, tableMask: 5,
-  frame: 6, leaked: 7, quarantined: 8, drained: 9,
+  frame: 6, leaked: 7, quarantined: 8, drained: 9, diffuse: 10,
 };
 // Uniforms (Float64) — values that can change between steps, plus stats.
 export const U = {
@@ -79,6 +79,10 @@ export function allocateBuffers(dp, { alloc = (n) => new ArrayBuffer(n), threads
     // particles through the sort (DFSPH warm start: pressure, divergence)
     carry: f32(N * (dfsph ? 2 : 0)), carryTmp: f32(N * (dfsph ? 2 : 0)),
     carryCount: dfsph ? 2 : 0,
+    // whitewater (DFSPH): diffuse particles [x y z vx vy vz life type] and the
+    // per-fluid-particle generation rate
+    D: dfsph ? dp.maxDiffuse : 0,
+    diffuse: f32((dfsph ? dp.maxDiffuse : 0) * 8), foamGen: f32(dfsph ? N : 0),
     reduce: f64(threads * 8),
   };
 }

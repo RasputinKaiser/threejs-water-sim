@@ -30,11 +30,12 @@ import { COLLIDER_STRIDE, F, FLAG_DYNAMIC, SHAPE, colliderSDF, colliderVelocity,
 import {
   FluidCore, H, U, PHASE as CORE_PHASE, TIMING, MAX_COLLIDER_CANDIDATES as K, BND_STRIDE, addImpulse,
 } from './fluid-core.js';
+import { generationRate, emitWhitewater, advectWhitewater } from './whitewater.js';
 
 export const PHASE = {
   ...CORE_PHASE, hash: 20, density: 21, divergenceResidual: 22, velocity: 23,
   forces: 24, confine: 25, densityResidual: 26, integrate: 27,
-  warmDensity: 28, warmDivergence: 29, densityGate: 30, divergenceGate: 31,
+  warmDensity: 28, warmDivergence: 29, densityGate: 30, divergenceGate: 31, whitewater: 32,
 };
 
 // carried per-particle state (fluid-core carry slots): the total k each
@@ -63,6 +64,9 @@ export class DFSPHSolver extends FluidCore {
     this.beta = new Float32Array(b.beta);
     this.kappa = new Float32Array(b.kappa);
     this.bndF = this.p.bndF; this.bndDF = this.p.bndDF;
+    this.D = b.D;
+    this.diffuse = new Float32Array(b.diffuse);
+    this.foamGen = new Float32Array(b.foamGen);
     this._wd = new Float64Array(5);
     this._wn = new Float64Array(15);
     this._ws = new Float64Array(5);
@@ -299,10 +303,12 @@ export class DFSPHSolver extends FluidCore {
     const xsph = 1 - Math.pow(1 - Math.min(u[U.viscosity], 0.99), frames);
     const fric = u[U.friction], invS = 1 / dp.spacing;
     const wantOmega = u[U.vorticity] > 0;
+    const gen = this.foamGen, ww = this.D > 0, invH = 1 / dp.h, invSurf = 1 / dp.wwSurfaceGrad;
     for (let i = i0; i < i1; i++) {
       const i3 = i * 3;
       const vxi = v[i3], vyi = v[i3 + 1], vzi = v[i3 + 2];
       let ax = 0, ay = 0, az = 0, wx = 0, wy = 0, wz = 0;
+      let ta = 0, cgx = 0, cgy = 0, cgz = 0;
       const base = i * M, e = base + cnt[i];
       for (let t = base; t < e; t++) {
         const j = nbr[t], j3 = j * 3, t4 = t * 4;
@@ -310,10 +316,33 @@ export class DFSPHSolver extends FluidCore {
         const ux = v[j3] - vxi, uy = v[j3 + 1] - vyi, uz = v[j3 + 2] - vzi;
         const w = pair[t4 + 3] * invRho;
         ax += ux * w; ay += uy * w; az += uz * w;
+        const qx = pair[t4] * invRho, qy = pair[t4 + 1] * invRho, qz = pair[t4 + 2] * invRho;
         if (wantOmega) {
-          const qx = pair[t4] * invRho, qy = pair[t4 + 1] * invRho, qz = pair[t4 + 2] * invRho;
           wx += uy * qz - uz * qy; wy += uz * qx - ux * qz; wz += ux * qy - uy * qx;
         }
+        if (ww) {
+          // colour-field gradient (points into the fluid) and trapped air:
+          // neighbors approaching (v_ij against x_ij), weighted (1 − r/h)
+          cgx += qx; cgy += qy; cgz += qz;
+          const dx = p[i3] - p[j3], dy = p[i3 + 1] - p[j3 + 1], dz = p[i3 + 2] - p[j3 + 2];
+          const r = Math.sqrt(dx * dx + dy * dy + dz * dz), vr = Math.sqrt(ux * ux + uy * uy + uz * uz);
+          if (r > 1e-9 && vr > 1e-6) {
+            // v_ij = v_i − v_j = −u
+            const c = -(ux * dx + uy * dy + uz * dz) / (vr * r);
+            ta += vr * (1 - c) * (1 - r * invH);
+          }
+        }
+      }
+      if (ww) {
+        // wave crest: surface-ness × outward speed along the surface normal
+        const cl = Math.sqrt(cgx * cgx + cgy * cgy + cgz * cgz);
+        let crest = 0;
+        if (cl > 1e-9) {
+          const surf = Math.min(1, cl * invSurf);
+          const out = -(vxi * cgx + vyi * cgy + vzi * cgz) / cl;
+          if (out > 0) crest = surf * out;
+        }
+        gen[i] = generationRate(dp, ta, crest, vxi * vxi + vyi * vyi + vzi * vzi);
       }
       let dvx = gx + xsph * ax, dvy = gy + xsph * ay, dvz = gz + xsph * az;
       // wall shear: quadratic drag τ = ρ C_f |u_t| u_t on the slip relative to
@@ -472,6 +501,7 @@ export class DFSPHSolver extends FluidCore {
       case PHASE.divergenceResidual: return this.phaseResidual(i0, i1, tid, false);
       case PHASE.densityResidual: return this.phaseResidual(i0, i1, tid, true);
       case PHASE.divergenceGate: return this.phaseResidual(i0, i1, tid, false, false);
+      case PHASE.whitewater: return advectWhitewater(this, i0, i1, this.u[U.dt]);
       case PHASE.densityGate: return this.phaseResidual(i0, i1, tid, true, false);
       case PHASE.velocity: return this.phaseVelocity(i0, i1, tid);
       case PHASE.forces: return this.phaseForces(i0, i1, tid);
@@ -500,7 +530,7 @@ export class DFSPHSolver extends FluidCore {
     T.fill(0);
     const t0 = performance.now();
     this.header[H.overflow] = 0;
-    const exec = parallel ?? ((id) => this.runPhase(id, 0, this.header[H.count], 0));
+    const exec = parallel ?? ((id, n = this.header[H.count]) => this.runPhase(id, 0, n, 0));
     const run = (id) => { const t = performance.now(); exec(id); T[id] += performance.now() - t; };
     // CFL: the fastest particle (plus what gravity adds over the step) moves
     // at most cfl · spacing per substep
@@ -567,6 +597,14 @@ export class DFSPHSolver extends FluidCore {
       T[TIMING.finalize] += performance.now() - tf;
     }
     u[U.dt] = dt;
+    // whitewater once per step: emit from the last substep's potentials,
+    // then advect every diffuse particle on the final grid (in parallel)
+    if (this.D > 0 && this.header[H.count] > 0) {
+      const t = performance.now();
+      const m = emitWhitewater(this, dt);
+      if (m > 0) exec(PHASE.whitewater, m);
+      T[PHASE.whitewater] += performance.now() - t;
+    }
     u[U.substeps] = sub;
     u[U.pressureIterations] = pIt / sub;
     u[U.divergenceIterations] = dIt / sub;

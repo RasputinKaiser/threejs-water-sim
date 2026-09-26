@@ -74,7 +74,8 @@ export async function createWater({
   if (renderer && render === 'screen') {
     screen = createScreenSpaceRenderer({
       renderer, capacity: dp.maxParticles, spacing: dp.spacing,
-      particleRadius: dp.h * 0.62, look,
+      particleRadius: dp.spacing * 0.62 * (dp.solver === 'dfsph' ? 1.8 : dp.kernelScale),
+      diffuseCapacity: dp.solver === 'dfsph' ? dp.maxDiffuse : 0, look,
     });
   } else if (scene && render === 'points') {
     const geo = new THREE.BufferGeometry();
@@ -183,7 +184,10 @@ export async function createWater({
     get mode() { return sim.mode; },
     get count() { return sim.count; },
     get stats() {
-      return { ...sim.stats, stepMs: sim.stepMs, threads: sim.threads, colliders: coupling?.stats.colliders, spawned: spawnedTotal };
+      return {
+        ...sim.stats, stepMs: sim.stepMs, threads: sim.threads, colliders: coupling?.stats.colliders,
+        spawned: spawnedTotal, whitewater: sim.diffuse?.count ?? 0,
+      };
     },
     /** The debug THREE.Points (render: 'points'), else null. */
     points,
@@ -261,7 +265,11 @@ export async function createWater({
       if (screen || points) {
         const n = sim.count;
         sim.interpolate(interp, sim.alpha);
-        if (screen) screen.setParticles(interp, n);
+        if (screen) {
+          screen.setParticles(interp, n);
+          const ww = sim.diffuse;
+          if (ww) screen.setDiffuse(ww.data, ww.count);
+        }
         if (points) {
           points.geometry.attributes.position.needsUpdate = true;
           points.geometry.setDrawRange(0, n);

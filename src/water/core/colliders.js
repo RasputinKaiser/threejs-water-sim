@@ -28,8 +28,9 @@ export const SHAPE = {
 export const F = {
   type: 0, px: 1, py: 2, pz: 3, qx: 4, qy: 5, qz: 6, qw: 7,
   sa: 8, sb: 9, sc: 10, vx: 11, vy: 12, vz: 13, wx: 14, wy: 15, wz: 16,
-  friction: 17, flags: 18, hf: 19, slot: 20, mass: 21, alpha: 22,
+  friction: 17, flags: 18, hf: 19, slot: 20, mass: 21, alpha: 22, bound: 23,
 };
+const UNBOUNDED = 1e30;
 
 export const FLAG_DYNAMIC = 1; // accumulate fluid impulses for rigid-body coupling
 
@@ -72,6 +73,21 @@ export function writeCollider(records, i, desc) {
   records[o + F.slot] = slot;
   records[o + F.mass] = desc.mass ?? 0;
   records[o + F.alpha] = 1;
+  // bounding radius around the position (quick reject); planes, containers
+  // and terrain are unbounded
+  const a = records[o + F.sa], b = records[o + F.sb], c = records[o + F.sc];
+  records[o + F.bound] = type === SHAPE.sphere ? a
+    : type === SHAPE.capsule ? a + b
+      : type === SHAPE.box ? Math.sqrt(a * a + b * b + c * c)
+        : UNBOUNDED;
+}
+
+/** Can collider i be within `reach` of (x,y,z)? (bounding-sphere test) */
+export function colliderNear(records, i, x, y, z, reach) {
+  const o = i * COLLIDER_STRIDE, r = records[o + F.bound] + reach;
+  if (r >= UNBOUNDED) return true;
+  const dx = x - records[o + F.px], dy = y - records[o + F.py], dz = z - records[o + F.pz];
+  return dx * dx + dy * dy + dz * dz < r * r;
 }
 
 // q · v (unit quaternion rotation), written into out[0..2]

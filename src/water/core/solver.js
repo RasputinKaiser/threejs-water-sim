@@ -42,6 +42,16 @@ export const U = {
 };
 const U_SIZE = 32;
 
+// Parallel phases (dispatch ids shared with worker threads).
+export const PHASE = {
+  predict: 1, gather: 2, scatterBack: 3, neighbors: 4, lambda: 5, delta: 6,
+  apply: 7, frictionVelocity: 8, vorticity1: 9, vorticity2: 10,
+};
+// Timing slots in solver.phaseMs (last step): parallel phases by id, plus
+export const TIMING = { sort: 11, finalize: 12, total: 13 };
+export const TIMING_NAMES = ['', 'predict', 'gather', 'scatterBack', 'neighbors', 'lambda', 'delta',
+  'apply', 'frictionVelocity', 'vorticity1', 'vorticity2', 'sort', 'finalize', 'total'];
+
 function nextPow2(n) { let p = 1; while (p < n) p <<= 1; return p; }
 
 /**
@@ -111,7 +121,7 @@ export class PBFSolver {
     this._candPos = new Float64Array(512 * 3);
     this._n = new Float64Array(3);
     this._cv = new Float64Array(3);
-    this._colR = new Float64Array(this.maxColliders); // per-collider bounding radius (Infinity = unbounded)
+    this.phaseMs = new Float64Array(TIMING_NAMES.length); // wall time per phase, last step
 
     // cohesion kernel normalization on the rest lattice
     this._cohNorm = 0;
@@ -681,31 +691,63 @@ export class PBFSolver {
     return out;
   }
 
-  /* ================= single-thread driver ================= */
+  /* ================= driver ================= */
 
-  /** Advance one step on the calling thread. */
-  step(dt) {
+  /** Run one parallel phase over particles [i0, i1) as thread `tid`. */
+  runPhase(id, i0, i1, tid = 0) {
+    switch (id) {
+      case PHASE.predict: return this.phasePredict(i0, i1);
+      case PHASE.gather: return this.phaseGather(i0, i1);
+      case PHASE.scatterBack: return this.phaseScatterBack(i0, i1);
+      case PHASE.neighbors: return this.phaseNeighbors(i0, i1, tid);
+      case PHASE.lambda: return this.phaseLambda(i0, i1);
+      case PHASE.delta: return this.phaseDelta(i0, i1, tid);
+      case PHASE.apply: return this.phaseApply(i0, i1, tid);
+      case PHASE.frictionVelocity:
+        this.phaseFriction(i0, i1, tid);
+        return this.phaseVelocity(i0, i1);
+      case PHASE.vorticity1: return this.phaseVorticity1(i0, i1);
+      case PHASE.vorticity2: return this.phaseVorticity2(i0, i1);
+      default: throw new Error(`unknown phase ${id}`);
+    }
+  }
+
+  /**
+   * Advance one step. `parallel(id)` runs a phase over all particles — by
+   * default on this thread; the thread pool passes a function that splits
+   * the range across workers and waits at a barrier.
+   */
+  step(dt, parallel = null) {
+    const T = this.phaseMs;
+    T.fill(0);
+    const t0 = performance.now();
     this.u[U.dt] = dt;
-    const n = this.header[H.count];
     this.header[H.overflow] = 0;
-    if (n > 0) {
-      this.phasePredict(0, n);
+    const exec = parallel ?? ((id) => this.runPhase(id, 0, this.header[H.count], 0));
+    const run = (id) => { const t = performance.now(); exec(id); T[id] += performance.now() - t; };
+    if (this.header[H.count] > 0) {
+      run(PHASE.predict);
+      let t = performance.now();
       this.phaseSort();
-      this.phaseGather(0, n);
-      this.phaseScatterBack(0, n);
-      this.phaseNeighbors(0, n, 0);
+      T[TIMING.sort] = performance.now() - t;
+      run(PHASE.gather);
+      run(PHASE.scatterBack);
+      run(PHASE.neighbors);
       const iters = this.u[U.iterations];
       for (let it = 0; it < iters; it++) {
-        this.phaseLambda(0, n);
-        this.phaseDelta(0, n, 0);
-        this.phaseApply(0, n, 0);
+        run(PHASE.lambda);
+        run(PHASE.delta);
+        run(PHASE.apply);
       }
-      this.phaseFriction(0, n, 0);
-      this.phaseVelocity(0, n);
-      this.phaseVorticity1(0, n);
-      this.phaseVorticity2(0, n);
+      run(PHASE.frictionVelocity);
+      run(PHASE.vorticity1);
+      run(PHASE.vorticity2);
     }
+    const tf = performance.now();
     this.phaseFinalize();
+    const t1 = performance.now();
+    T[TIMING.finalize] = t1 - tf;
+    T[TIMING.total] = t1 - t0;
   }
 }
 
